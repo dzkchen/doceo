@@ -24,6 +24,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+TIMING_EARLY_LATE_THRESHOLD_MS = 120
+
 
 def _session_dir(session_id: str, *, create: bool = False) -> Path:
     d = STORAGE / session_id
@@ -123,6 +125,14 @@ def _note_match_cost(ref_note: dict[str, int], played_note: dict[str, int]) -> f
     return pitch_cost + onset_cost + duration_cost
 
 
+def _timing_status(timing_delta_ms: int) -> str:
+    if timing_delta_ms <= -TIMING_EARLY_LATE_THRESHOLD_MS:
+        return "early"
+    if timing_delta_ms >= TIMING_EARLY_LATE_THRESHOLD_MS:
+        return "late"
+    return "on-time"
+
+
 def _dtw_align_notes(
     reference_notes: list[dict[str, int]],
     played_notes: list[dict[str, int]],
@@ -187,6 +197,9 @@ def _dtw_align_notes(
     missed_count = 0
     wrong_pitch_count = 0
     correct_count = 0
+    early_count = 0
+    late_count = 0
+    on_time_count = 0
 
     i = n
     j = m
@@ -199,16 +212,27 @@ def _dtw_align_notes(
             played_note = played_notes[played_idx]
             pitch_delta = played_note["pitch"] - ref_note["pitch"]
             timing_delta = (played_note["onset_ms"] - played_start) - (ref_note["onset_ms"] - ref_start)
-            status = "correct" if pitch_delta == 0 else "wrong-pitch"
-            if status == "correct":
-                correct_count += 1
+            timing_status = _timing_status(timing_delta)
+            if pitch_delta == 0:
+                if timing_status == "early":
+                    status = "early"
+                    early_count += 1
+                elif timing_status == "late":
+                    status = "late"
+                    late_count += 1
+                else:
+                    status = "correct"
+                    correct_count += 1
+                    on_time_count += 1
             else:
+                status = "wrong-pitch"
                 wrong_pitch_count += 1
             alignment.append(
                 {
                     "refIdx": ref_idx,
                     "playedIdx": played_idx,
                     "status": status,
+                    "timingStatus": timing_status,
                     "timingDeltaMs": timing_delta,
                     "pitchDelta": pitch_delta,
                 }
@@ -218,6 +242,7 @@ def _dtw_align_notes(
                     "refIdx": ref_idx,
                     "playedIdx": played_idx,
                     "status": status,
+                    "timingStatus": timing_status,
                     "timingDeltaMs": timing_delta,
                     "pitchDelta": pitch_delta,
                 }
@@ -234,6 +259,7 @@ def _dtw_align_notes(
                     "refIdx": ref_idx,
                     "playedIdx": None,
                     "status": "missed",
+                    "timingStatus": None,
                     "timingDeltaMs": None,
                     "pitchDelta": None,
                 }
@@ -243,6 +269,7 @@ def _dtw_align_notes(
                     "refIdx": ref_idx,
                     "playedIdx": None,
                     "status": "missed",
+                    "timingStatus": None,
                     "timingDeltaMs": None,
                     "pitchDelta": None,
                 }
@@ -258,6 +285,7 @@ def _dtw_align_notes(
                     "refIdx": None,
                     "playedIdx": played_idx,
                     "status": "extra",
+                    "timingStatus": None,
                     "timingDeltaMs": None,
                     "pitchDelta": None,
                 }
@@ -301,6 +329,7 @@ def _dtw_align_notes(
                 "velocity": ref_note["velocity"],
                 "status": ann["status"],
                 "playedIdx": ann["playedIdx"],
+                "timingStatus": ann["timingStatus"],
                 "timingDeltaMs": ann["timingDeltaMs"],
                 "pitchDelta": ann["pitchDelta"],
             }
@@ -308,12 +337,16 @@ def _dtw_align_notes(
 
     summary = {
         "correct": correct_count,
+        "early": early_count,
+        "late": late_count,
+        "onTime": on_time_count,
         "wrongPitch": wrong_pitch_count,
         "missed": missed_count,
         "extra": extra_count,
-        "matched": correct_count + wrong_pitch_count,
+        "matched": correct_count + early_count + late_count + wrong_pitch_count,
         "referenceCount": n,
         "playedCount": m,
+        "timingThresholdMs": TIMING_EARLY_LATE_THRESHOLD_MS,
     }
     return alignment, annotated_reference_notes, extra_played_notes, summary
 
