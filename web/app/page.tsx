@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Masthead, type Stage } from "./components/Masthead";
 import { ProgressRail } from "./components/ProgressRail";
 import { Footer } from "./components/Footer";

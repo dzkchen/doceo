@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import type {
   MidiResponse, VideoResponse, AlignResponse, PlayedNote,
   PoseResponse, TutorResponse, FocusArea, AnnotatedReferenceNote,
@@ -33,7 +33,6 @@ type ResultsStageProps = {
   resolveApiUrl: (path: string) => string;
   postureWarning: string | null;
   tutorWarning: string | null;
-  onReset: () => void;
 };
 
 export function ResultsStage({
@@ -41,7 +40,7 @@ export function ResultsStage({
   focusAreas, dynamicsOutlierCount, analysisDurationMs,
   renderMode, setRenderMode, showPoseOverlay, setShowPoseOverlay,
   onGenerateTutor, onSeekVideo, performanceVideoRef,
-  resolveApiUrl, postureWarning, tutorWarning, onReset,
+  resolveApiUrl, postureWarning, tutorWarning,
 }: ResultsStageProps) {
   const s = alignment.summary;
 
@@ -364,7 +363,6 @@ function TutorVerdict({
               </p>
               <audio
                 key={tutor.audioUrl}
-                autoPlay
                 controls
                 preload="auto"
                 src={resolveUrl(tutor.audioUrl)}

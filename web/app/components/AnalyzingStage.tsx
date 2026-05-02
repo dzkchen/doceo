@@ -19,24 +19,16 @@ type AnalyzingStageProps = {
 
 export function AnalyzingStage({ midi, video }: AnalyzingStageProps) {
   const [step, setStep] = useState(0);
-  const [typed, setTyped] = useState("");
 
   useEffect(() => {
     if (step >= LOG_LINES.length) return;
-    const target = LOG_LINES[step];
-    let i = 0;
-    setTyped("");
-    const tick = setInterval(() => {
-      i++;
-      setTyped(target.slice(0, i));
-      if (i >= target.length) {
-        clearInterval(tick);
-        if (step < LOG_LINES.length - 1) {
-          setTimeout(() => setStep((s) => s + 1), 900);
-        }
+    const delay = LOG_LINES[step].length * 22 + 900;
+    const timeout = setTimeout(() => {
+      if (step < LOG_LINES.length - 1) {
+        setStep((s) => s + 1);
       }
-    }, 22);
-    return () => clearInterval(tick);
+    }, delay);
+    return () => clearTimeout(timeout);
   }, [step]);
 
   const pct = Math.min(100, ((step + 0.5) / LOG_LINES.length) * 100);
@@ -92,7 +84,7 @@ export function AnalyzingStage({ midi, video }: AnalyzingStageProps) {
                   fontSize: 13,
                   color: done ? "var(--ink-mute)" : active ? "var(--ink)" : "var(--ink-faint)",
                   opacity: i > step ? 0.4 : 1,
-                  gap: 10,
+                gap: 10,
                 }}
               >
                 <span
@@ -104,7 +96,7 @@ export function AnalyzingStage({ midi, video }: AnalyzingStageProps) {
                   {done ? "✓" : active ? "→" : "·"}
                 </span>
                 <span className={active ? "cursor" : ""}>
-                  {active ? typed : line}
+                  {active ? <TypingLine text={line} /> : line}
                 </span>
               </div>
             );
@@ -172,6 +164,24 @@ function Waveform() {
       ))}
     </div>
   );
+}
+
+function TypingLine({ text }: { text: string }) {
+  const [typed, setTyped] = useState("");
+
+  useEffect(() => {
+    let i = 0;
+    const tick = setInterval(() => {
+      i++;
+      setTyped(text.slice(0, i));
+      if (i >= text.length) {
+        clearInterval(tick);
+      }
+    }, 22);
+    return () => clearInterval(tick);
+  }, [text]);
+
+  return <>{typed}</>;
 }
 
 function FactCard({ label, value, sub }: { label: string; value: string; sub: string }) {
