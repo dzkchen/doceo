@@ -5,7 +5,23 @@
 <h1 align="center"><b>Privtor AI</b></h1>
 
 <p align="center">
-  An AI piano practice coach that listens to your performance video, transcribes the audio, aligns it to the score, checks posture, and gives targeted feedback.
+  AI piano practice coach for turning one performance video into score alignment, posture checks, and actionable feedback.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI" />
+  <img src="https://img.shields.io/badge/Next.js-000000?style=for-the-badge&logo=nextdotjs&logoColor=white" alt="Next.js" />
+  <img src="https://img.shields.io/badge/MediaPipe-ff6f00?style=for-the-badge" alt="MediaPipe" />
+  <img src="https://img.shields.io/badge/Basic%20Pitch-4f46e5?style=for-the-badge" alt="Basic Pitch" />
+  <img src="https://img.shields.io/badge/OpenCV-5c3c00?style=for-the-badge&logo=opencv&logoColor=white" alt="OpenCV" />
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" />
+  <img src="https://img.shields.io/badge/React-61DAFB?style=for-the-badge&logo=react&logoColor=black" alt="React" />
+  <img src="https://img.shields.io/badge/ffmpeg-4e4e4e?style=for-the-badge" alt="ffmpeg" />
+  <img src="https://img.shields.io/badge/Gemini-8b5cf6?style=for-the-badge" alt="Gemini" />
+  <img src="https://img.shields.io/badge/ElevenLabs-111827?style=for-the-badge" alt="ElevenLabs" />
 </p>
 
 ## Inspiration
@@ -31,20 +47,23 @@ Privtor AI takes in:
 Then it:
 
 1. extracts audio from the video
-2. transcribes the performance into MIDI-like note events
+2. transcribes the performance into note events
 3. aligns the played notes against the reference score
 4. analyzes posture from sampled video frames
-5. generates feedback and drills for the performer
-6. renders the result in a web interface with score view, piano roll, video playback, and pose overlay
+5. generates feedback and drills
+6. renders the result in a web interface
 
-The result is a practice review that focuses on accuracy, timing, dynamics, posture, and tempo.
+Output:
+
+- score annotations
+- piano-roll fallback
+- video playback with pose overlay
+- reference audio playback
+- AI tutor feedback
 
 ## How I Built It
 
 ### Frontend
-
-The UI is a Next.js app in `web/` that manages the full practice flow:
-
 - upload reference MIDI
 - upload performance video
 - run analysis
@@ -63,7 +82,7 @@ The results page shows:
 
 The backend lives in `api/` and is built with FastAPI.
 
-The pipeline is split into clear steps:
+Pipeline:
 
 - `/midi` parses the reference MIDI, exports MusicXML, and synthesizes a reference audio track
 - `/video` stores the performance video and extracts a mono WAV file with `ffmpeg`
@@ -84,6 +103,33 @@ The pipeline is split into clear steps:
 - `MediaPipe` for pose and hand landmark detection
 - `Gemini` for tutor script generation
 - `ElevenLabs` for voice output
+
+## Tech Stack
+
+### Frontend
+
+- `Next.js 16`
+- `React 19`
+- `TypeScript`
+- `OpenSheetMusicDisplay`
+
+### Backend
+
+- `FastAPI`
+- `Uvicorn`
+- `Python`
+- `pretty_midi`
+- `music21`
+- `basic-pitch`
+- `fastdtw`
+- `OpenCV`
+- `MediaPipe`
+- `ffmpeg`
+
+### AI and Feedback
+
+- `Gemini` for written tutor feedback
+- `ElevenLabs` for audio narration
 
 ## Challenge: Converting Video to MIDI With High Accuracy
 
@@ -112,22 +158,22 @@ That combination of transcription plus alignment is what makes the output feel c
 
 ## What I Learned
 
-- Audio transcription alone is not enough; you need cleanup and alignment to make the result trustworthy.
-- Reference-aware heuristics matter a lot when the performance is close to the score but not exact.
-- Video analysis and audio analysis complement each other well. Audio explains what was played; pose explains how it was played.
-- The best feedback is specific and actionable, not just a score.
-- A good AI tutor needs structured inputs, not just a raw prompt.
+- Audio transcription needs cleanup and alignment to be useful.
+- Reference-aware heuristics matter when performances drift from the score.
+- Audio and video analysis solve different parts of the problem.
+- Specific feedback beats a raw score.
+- Structured inputs make AI feedback much better.
 
 ## Next Steps to Scale This Project
 
-- improve transcription accuracy on harder, noisier recordings
-- support longer performances and larger score excerpts
-- add better left-hand/right-hand separation
-- improve posture scoring with more robust ergonomic metrics
-- support multi-movement or multi-song sessions
-- add analytics across multiple practice attempts so progress can be tracked over time
-- deploy the pipeline so analysis can run reliably at scale
-- make the tutor feedback more personalized by learning a user’s recurring mistakes
+- improve transcription accuracy on noisier recordings
+- support longer performances and bigger excerpts
+- separate left-hand and right-hand analysis
+- improve posture scoring
+- support multi-song sessions
+- track progress across practice attempts
+- deploy the pipeline for reliable scale
+- personalize feedback from recurring mistakes
 
 ## Local Development
 
@@ -147,7 +193,7 @@ npm install
 npm run dev
 ```
 
-Then open the app in the browser and upload a reference MIDI file plus a performance video.
+Open the app and upload a reference MIDI plus a performance video.
 
 ## Repo Structure
 
