@@ -1,3 +1,6 @@
 .env
 .venv/
 api/.venv/
+tests/
+api/assets/*.sf2
+api/assets/*.sf3

@@ -9,6 +9,8 @@ const STATUS_COLORS: Record<Exclude<AnnotatedStatus, "correct">, string> = {
   missed: "#9ca3af",
   extra: "#f97316",
 };
+const DYNAMIC_DELTA_ALERT_THRESHOLD = 40;
+const DYNAMIC_ALERT_COLOR = "#f59e0b";
 
 const POSTURE_RULE_COLORS = {
   slouched_back: "#2563eb",
@@ -31,12 +33,19 @@ type MidiResponse = {
   tempoBpm: number | null;
   durationMs: number;
   noteCount: number;
+  referenceAudioPath: string | null;
+  referenceAudioUrl: string | null;
+  referenceAudioSampleRate: number | null;
+  referenceAudioRenderer: "fluidsynth_sf2" | "fallback_wave" | null;
 };
 
 type VideoResponse = {
   sessionId: string;
   videoPath: string;
+  videoUrl: string;
   audioPath: string;
+  performanceAudioUrl: string;
+  audioSampleRate: number;
 };
 
 type PlayedNote = {
@@ -65,6 +74,8 @@ type AnnotatedReferenceNote = {
   timingStatus: "on-time" | "early" | "late" | null;
   timingDeltaMs: number | null;
   pitchDelta: number | null;
+  dynamicDelta: number | null;
+  dynamicLabel: string | null;
 };
 
 type AlignmentSummary = {
@@ -176,6 +187,16 @@ function resolveApiUrl(path: string): string {
   return `${API_BASE}${path}`;
 }
 
+function hasDynamicOutlier(note: AnnotatedReferenceNote): boolean {
+  return note.dynamicDelta !== null && Math.abs(note.dynamicDelta) > DYNAMIC_DELTA_ALERT_THRESHOLD;
+}
+
+function dynamicTooltip(note: AnnotatedReferenceNote): string | null {
+  if (!hasDynamicOutlier(note)) return null;
+  const label = note.dynamicLabel ?? (note.dynamicDelta! > 0 ? "much louder than written" : "much softer than written");
+  return `${label} (${note.dynamicDelta! > 0 ? "+" : ""}${note.dynamicDelta})`;
+}
+
 export default function Home() {
   const [midi, setMidi] = useState<MidiResponse | null>(null);
   const [video, setVideo] = useState<VideoResponse | null>(null);
@@ -188,6 +209,7 @@ export default function Home() {
   const [postureWarning, setPostureWarning] = useState<string | null>(null);
   const [tutorWarning, setTutorWarning] = useState<string | null>(null);
   const [renderMode, setRenderMode] = useState<"score" | "piano-roll">("score");
+  const performanceVideoRef = useRef<HTMLVideoElement | null>(null);
 
   async function uploadMidi(file: File) {
     setBusy("midi");
@@ -313,7 +335,17 @@ export default function Home() {
     }
   }
 
+  function seekPerformanceVideo(onsetMs: number) {
+    const player = performanceVideoRef.current;
+    if (!player) return;
+    player.currentTime = Math.max(0, onsetMs / 1000);
+  }
+
   const redCount = alignment ? alignment.summary.wrongPitch : 0;
+  const dynamicsOutlierCount = useMemo(() => {
+    if (!alignment) return 0;
+    return alignment.annotatedReferenceNotes.filter(hasDynamicOutlier).length;
+  }, [alignment]);
   const analysisDurationMs = useMemo(() => {
     const midiDuration = midi?.durationMs ?? 0;
     const playedDuration = (playedNotes ?? []).reduce(
@@ -409,10 +441,63 @@ export default function Home() {
             Timing (±{alignment.summary.timingThresholdMs}ms): {alignment.summary.onTime} on-time, {alignment.summary.early} early, {alignment.summary.late} late.
           </p>
         )}
+        {alignment && (
+          <p className="mt-1 text-sm text-zinc-600">
+            Dynamics alerts (|delta| &gt; {DYNAMIC_DELTA_ALERT_THRESHOLD}): {dynamicsOutlierCount}.
+          </p>
+        )}
         {pose && (
           <p className="mt-1 text-sm text-zinc-600">
             Posture flags: {pose.postureSummary.flagCount} total across {pose.sampledFrameCount} sampled frames at ~{pose.sampleFps.toFixed(1)}fps.
           </p>
+        )}
+        {(video?.videoUrl || midi?.referenceAudioUrl) && (
+          <div className="mt-3 rounded border border-zinc-200 p-3 dark:border-zinc-800">
+            <h3 className="text-sm font-semibold text-zinc-800 dark:text-zinc-100">A/B playback</h3>
+            <div className="mt-2 grid grid-cols-1 gap-4 md:grid-cols-2">
+              <div className="space-y-2">
+                <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">
+                  Your performance
+                </p>
+                {video?.videoUrl ? (
+                  <video
+                    ref={performanceVideoRef}
+                    controls
+                    preload="metadata"
+                    src={resolveApiUrl(video.videoUrl)}
+                    className="w-full rounded border border-zinc-200 dark:border-zinc-800"
+                  />
+                ) : (
+                  <p className="text-sm text-zinc-500">Upload performance video to enable scrubbing.</p>
+                )}
+              </div>
+              <div className="space-y-2">
+                <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">
+                  Correct version
+                </p>
+                {midi?.referenceAudioUrl ? (
+                  <>
+                    <audio
+                      controls
+                      preload="metadata"
+                      src={resolveApiUrl(midi.referenceAudioUrl)}
+                      className="w-full"
+                    />
+                    <p className="text-xs text-zinc-500">
+                      Renderer:{" "}
+                      {midi.referenceAudioRenderer === "fluidsynth_sf2"
+                        ? "sampled piano (SoundFont)"
+                        : "synth fallback"}
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-sm text-zinc-500">
+                    Reference audio synthesis unavailable for this MIDI.
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
         )}
         {alignment && (
           <div className="mt-3 space-y-2 rounded border border-zinc-200 p-3 dark:border-zinc-800">
@@ -464,12 +549,14 @@ export default function Home() {
             musicxml={midi.musicxml}
             annotatedReferenceNotes={alignment?.annotatedReferenceNotes ?? null}
             onColoringFailure={() => setRenderMode("piano-roll")}
+            onNoteScrub={seekPerformanceVideo}
           />
         ) : renderMode === "piano-roll" && midi ? (
           <PianoRollView
             referenceNotes={midi.referenceNotes}
             annotatedReferenceNotes={alignment?.annotatedReferenceNotes ?? null}
             playedNotes={playedNotes}
+            onNoteScrub={seekPerformanceVideo}
           />
         ) : (
           <p className="text-zinc-400">Upload a MIDI to see the score render here.</p>
@@ -477,7 +564,7 @@ export default function Home() {
 
         {alignment && redCount > 0 && (
           <p className="mt-2 text-sm text-zinc-600">
-            Done condition check: {redCount} red wrong-pitch notes detected.
+            Done condition check: {redCount} red wrong-pitch notes detected. Click highlighted notes to scrub the performance video.
           </p>
         )}
         {pose && (
@@ -529,10 +616,12 @@ function ScoreView({
   musicxml,
   annotatedReferenceNotes,
   onColoringFailure,
+  onNoteScrub,
 }: {
   musicxml: string;
   annotatedReferenceNotes: AnnotatedReferenceNote[] | null;
   onColoringFailure: () => void;
+  onNoteScrub: (onsetMs: number) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
 
@@ -559,6 +648,7 @@ function ScoreView({
         inst.render();
         if (annotatedReferenceNotes?.length) {
           applyAlignmentColors(inst as unknown as OsmdLike, annotatedReferenceNotes, "post-render");
+          bindScoreScrubClicks(inst as unknown as OsmdLike, annotatedReferenceNotes, onNoteScrub);
         }
       } catch (e) {
         console.error("OSMD load/render failed", e);
@@ -573,7 +663,7 @@ function ScoreView({
       cancelled = true;
       container.innerHTML = "";
     };
-  }, [musicxml, annotatedReferenceNotes, onColoringFailure]);
+  }, [musicxml, annotatedReferenceNotes, onColoringFailure, onNoteScrub]);
 
   return (
     <div
@@ -610,15 +700,12 @@ type OsmdLike = {
           applyToSlurs: boolean;
         },
       ) => void;
+      getSVGGElement?: () => SVGGElement;
     } | null;
   };
 };
 
-function applyAlignmentColors(
-  osmd: OsmdLike,
-  annotatedReferenceNotes: AnnotatedReferenceNote[],
-  phase: "pre-render" | "post-render",
-) {
+function collectSourceNotes(osmd: OsmdLike): unknown[] {
   const sourceNotes: unknown[] = [];
   const sourceMeasures = osmd.Sheet?.SourceMeasures ?? [];
 
@@ -635,9 +722,17 @@ function applyAlignmentColors(
       }
     }
   }
+  return sourceNotes;
+}
 
-  const statusByRefIdx = new Map<number, AnnotatedStatus>(
-    annotatedReferenceNotes.map((note) => [note.refIdx, note.status]),
+function applyAlignmentColors(
+  osmd: OsmdLike,
+  annotatedReferenceNotes: AnnotatedReferenceNote[],
+  phase: "pre-render" | "post-render",
+) {
+  const sourceNotes = collectSourceNotes(osmd);
+  const byRefIdx = new Map<number, AnnotatedReferenceNote>(
+    annotatedReferenceNotes.map((note) => [note.refIdx, note]),
   );
 
   let refIdx = 0;
@@ -649,9 +744,16 @@ function applyAlignmentColors(
       }
     }
 
-    const status = statusByRefIdx.get(refIdx);
-    if (status && status !== "correct") {
-      const color = STATUS_COLORS[status];
+    const annotated = byRefIdx.get(refIdx);
+    const status = annotated?.status;
+    const dynamicOutlier = annotated ? hasDynamicOutlier(annotated) : false;
+    const color = dynamicOutlier
+      ? DYNAMIC_ALERT_COLOR
+      : status && status !== "correct"
+        ? STATUS_COLORS[status]
+        : null;
+
+    if (color) {
       const note = sourceNote as {
         NoteheadColor?: string;
         ParentVoiceEntry?: { StemColor?: string };
@@ -675,6 +777,63 @@ function applyAlignmentColors(
         });
       }
     }
+    refIdx += 1;
+  }
+}
+
+function bindScoreScrubClicks(
+  osmd: OsmdLike,
+  annotatedReferenceNotes: AnnotatedReferenceNote[],
+  onNoteScrub: (onsetMs: number) => void,
+) {
+  const sourceNotes = collectSourceNotes(osmd);
+  const byRefIdx = new Map<number, AnnotatedReferenceNote>(
+    annotatedReferenceNotes.map((note) => [note.refIdx, note]),
+  );
+
+  let refIdx = 0;
+  for (const sourceNote of sourceNotes) {
+    if (typeof sourceNote === "object" && sourceNote && "isRest" in sourceNote) {
+      const restNote = sourceNote as { isRest?: () => boolean };
+      if (typeof restNote.isRest === "function" && restNote.isRest()) {
+        continue;
+      }
+    }
+
+    const annotated = byRefIdx.get(refIdx);
+    if (!annotated) {
+      refIdx += 1;
+      continue;
+    }
+    const dynamicHint = dynamicTooltip(annotated);
+    const clickable = annotated.status !== "correct" || dynamicHint !== null;
+    if (!clickable) {
+      refIdx += 1;
+      continue;
+    }
+
+    const graphicalNote = osmd.EngravingRules?.GNote?.(sourceNote);
+    const group = graphicalNote?.getSVGGElement?.();
+    if (!group) {
+      refIdx += 1;
+      continue;
+    }
+
+    group.style.cursor = "pointer";
+    group.setAttribute("tabindex", "0");
+    group.setAttribute("role", "button");
+    const baseText = `${(annotated.onset_ms / 1000).toFixed(2)}s`;
+    const titleText = dynamicHint
+      ? `${baseText} · ${dynamicHint}`
+      : `${baseText} · ${annotated.status}`;
+    group.setAttribute("title", titleText);
+    group.onclick = () => onNoteScrub(annotated.onset_ms);
+    group.onkeydown = (event: KeyboardEvent) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        onNoteScrub(annotated.onset_ms);
+      }
+    };
     refIdx += 1;
   }
 }
@@ -756,18 +915,20 @@ function PianoRollView({
   referenceNotes,
   annotatedReferenceNotes,
   playedNotes,
+  onNoteScrub,
 }: {
   referenceNotes: ReferenceNote[];
   annotatedReferenceNotes: AnnotatedReferenceNote[] | null;
   playedNotes: PlayedNote[] | null;
+  onNoteScrub: (onsetMs: number) => void;
 }) {
   const width = 980;
   const height = 360;
   const padX = 22;
   const padY = 18;
 
-  const statusByRefIdx = useMemo(
-    () => new Map((annotatedReferenceNotes ?? []).map((n) => [n.refIdx, n.status])),
+  const annotatedByRefIdx = useMemo(
+    () => new Map((annotatedReferenceNotes ?? []).map((n) => [n.refIdx, n])),
     [annotatedReferenceNotes],
   );
 
@@ -805,9 +966,20 @@ function PianoRollView({
           const x = padX + (note.onset / maxTime) * drawW;
           const w = Math.max(1.5, (note.duration / maxTime) * drawW);
           const y = padY + ((maxPitch - note.pitch) / pitchSpan) * drawH;
-          const status = statusByRefIdx.get(idx) ?? "correct";
-          const color = status === "correct" ? "#cbd5e1" : STATUS_COLORS[status];
-          const opacity = status === "correct" ? 0.45 : 0.8;
+          const annotated = annotatedByRefIdx.get(idx);
+          const status = annotated?.status ?? "correct";
+          const dynamicHint = annotated ? dynamicTooltip(annotated) : null;
+          const color = dynamicHint
+            ? DYNAMIC_ALERT_COLOR
+            : status === "correct"
+              ? "#cbd5e1"
+              : STATUS_COLORS[status];
+          const opacity = dynamicHint ? 0.92 : status === "correct" ? 0.45 : 0.8;
+          const clickable = Boolean(annotated) && (status !== "correct" || dynamicHint !== null);
+          const onsetMs = annotated?.onset_ms ?? note.onset;
+          const title = dynamicHint
+            ? `${(onsetMs / 1000).toFixed(2)}s · ${dynamicHint}`
+            : `${(onsetMs / 1000).toFixed(2)}s · ${status}`;
           return (
             <rect
               key={`ref-${idx}`}
@@ -817,7 +989,11 @@ function PianoRollView({
               height={4}
               fill={color}
               opacity={opacity}
-            />
+              onClick={clickable ? () => onNoteScrub(onsetMs) : undefined}
+              style={clickable ? { cursor: "pointer" } : undefined}
+            >
+              <title>{title}</title>
+            </rect>
           );
         })}
 
@@ -839,7 +1015,7 @@ function PianoRollView({
         })}
       </svg>
       <p className="mt-2 text-sm text-zinc-600">
-        Legend: red = wrong pitch, gray = missed reference note, orange = extra played note.
+        Legend: red = wrong pitch, gray = missed reference note, orange = dynamic outlier (|delta| &gt; 40), black = played notes.
       </p>
     </div>
   );

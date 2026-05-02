@@ -1,4 +1,5 @@
 
+import copy
 import json
 import math
 import os
@@ -43,6 +44,11 @@ app.add_middleware(
 
 TIMING_EARLY_LATE_THRESHOLD_MS = 150
 REFERENCE_SYNTH_SAMPLE_RATE = 22050
+REFERENCE_SYNTH_LOWPASS_HZ = 5200.0
+LEGATO_CLOSE_GAP_MAX_SEC = 0.09
+LEGATO_OVERLAP_SEC = 0.018
+LEGATO_MAX_EXTENSION_SEC = 0.14
+FLUIDSYNTH_GAIN = 0.8
 DYNAMIC_DELTA_ALERT_THRESHOLD = 40
 POSE_SAMPLE_FPS = 10
 POSTURE_MIN_SEGMENT_MS = 500
@@ -188,20 +194,154 @@ def _media_type_for_suffix(suffix: str) -> str:
     return mapping.get(suffix.lower(), "application/octet-stream")
 
 
-def _synthesize_reference_audio(pm: pretty_midi.PrettyMIDI, *, sdir: Path) -> Path | None:
+def _resolve_soundfont_path() -> Path | None:
+    env_path = os.getenv("PIANO_SOUNDFONT_PATH")
+    if env_path and env_path.strip():
+        candidate = Path(env_path.strip()).expanduser()
+        if candidate.exists() and candidate.suffix.lower() in {".sf2", ".sf3"}:
+            return candidate
+
+    bundled = PROJECT_ROOT / "api" / "assets" / "GeneralUser-GS.sf2"
+    if bundled.exists():
+        return bundled
+    return None
+
+
+def _legatoize_pretty_midi(pm: pretty_midi.PrettyMIDI) -> pretty_midi.PrettyMIDI:
+    legato_pm = copy.deepcopy(pm)
+
+    for inst in legato_pm.instruments:
+        if inst.is_drum or not inst.notes:
+            continue
+
+        inst.notes.sort(key=lambda note: (note.start, note.pitch))
+        for idx in range(len(inst.notes) - 1):
+            note = inst.notes[idx]
+            nxt = inst.notes[idx + 1]
+            if nxt.start <= note.start + 1e-5:
+                continue
+            gap = nxt.start - note.end
+            if gap < 0.0 or gap > LEGATO_CLOSE_GAP_MAX_SEC:
+                continue
+
+            target_end = min(
+                nxt.start + LEGATO_OVERLAP_SEC,
+                note.end + LEGATO_MAX_EXTENSION_SEC,
+            )
+            if target_end > note.end:
+                note.end = target_end
+
+        end_time = max(note.end for note in inst.notes)
+        inst.control_changes.append(pretty_midi.ControlChange(number=64, value=92, time=0.0))
+        inst.control_changes.append(
+            pretty_midi.ControlChange(number=64, value=0, time=end_time + 0.08)
+        )
+        inst.control_changes.sort(key=lambda cc: cc.time)
+
+    return legato_pm
+
+
+def _render_with_fluidsynth(pm: pretty_midi.PrettyMIDI, *, sdir: Path) -> Path | None:
+    soundfont_path = _resolve_soundfont_path()
+    if soundfont_path is None:
+        print("[midi] sampled render skipped: no SoundFont (.sf2/.sf3) configured")
+        return None
+
+    fluidsynth_bin = shutil.which("fluidsynth")
+    if not fluidsynth_bin:
+        print("[midi] sampled render skipped: fluidsynth binary not found")
+        return None
+
+    legato_pm = _legatoize_pretty_midi(pm)
+    legato_midi_path = sdir / "reference_legato.mid"
+    legato_pm.write(str(legato_midi_path))
+
+    audio_path = sdir / "reference_synth.wav"
+    cmd = [
+        fluidsynth_bin,
+        "-ni",
+        "-q",
+        "-T",
+        "wav",
+        "-F",
+        str(audio_path),
+        "-r",
+        str(REFERENCE_SYNTH_SAMPLE_RATE),
+        "-g",
+        str(FLUIDSYNTH_GAIN),
+        "-C",
+        "0",
+        "-R",
+        "1",
+        str(soundfont_path),
+        str(legato_midi_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 or not audio_path.exists():
+        stderr_tail = result.stderr[-500:] if isinstance(result.stderr, str) else ""
+        stdout_tail = result.stdout[-200:] if isinstance(result.stdout, str) else ""
+        print(f"[midi] fluidsynth render failed ({result.returncode}): {stderr_tail}{stdout_tail}")
+        return None
+
+    return audio_path
+
+
+def _piano_like_wave(phase: np.ndarray) -> np.ndarray:
+    # Harmonic mix tuned for a mellow piano-like timbre instead of a plain sine.
+    return (
+        0.72 * np.sin(phase)
+        + 0.34 * np.sin(2.0 * phase + 0.015)
+        + 0.21 * np.sin(3.0 * phase)
+        + 0.14 * np.sin(4.01 * phase)
+        + 0.09 * np.sin(5.02 * phase)
+        + 0.05 * np.sin(6.03 * phase)
+    )
+
+
+def _one_pole_lowpass(signal: np.ndarray, *, sample_rate: int, cutoff_hz: float) -> np.ndarray:
+    if signal.size <= 1:
+        return signal
+    if cutoff_hz <= 0.0:
+        return signal
+
+    alpha = math.exp(-2.0 * math.pi * cutoff_hz / float(sample_rate))
+    output = np.empty_like(signal, dtype=np.float32)
+    output[0] = float(signal[0])
+    coeff = 1.0 - alpha
+    for idx in range(1, signal.shape[0]):
+        output[idx] = coeff * float(signal[idx]) + alpha * output[idx - 1]
+    return output
+
+
+def _synthesize_reference_audio(
+    pm: pretty_midi.PrettyMIDI,
+    *,
+    sdir: Path,
+) -> tuple[Path | None, str | None]:
+    sampled_audio_path = _render_with_fluidsynth(pm, sdir=sdir)
+    if sampled_audio_path is not None:
+        return sampled_audio_path, "fluidsynth_sf2"
+
     try:
-        samples = pm.synthesize(fs=REFERENCE_SYNTH_SAMPLE_RATE)
+        samples = pm.synthesize(fs=REFERENCE_SYNTH_SAMPLE_RATE, wave=_piano_like_wave)
     except Exception as exc:
         print(f"[midi] reference audio synthesis failed: {exc}")
-        return None
+        return None, None
 
     waveform = np.asarray(samples, dtype=np.float32)
     if waveform.size == 0:
-        return None
+        return None, None
     if waveform.ndim > 1:
         waveform = waveform.mean(axis=1)
 
     waveform = np.nan_to_num(waveform, nan=0.0, posinf=1.0, neginf=-1.0)
+    waveform = waveform - float(np.mean(waveform))
+    waveform = _one_pole_lowpass(
+        waveform,
+        sample_rate=REFERENCE_SYNTH_SAMPLE_RATE,
+        cutoff_hz=REFERENCE_SYNTH_LOWPASS_HZ,
+    )
+    waveform = np.tanh(1.35 * waveform)
     peak = float(np.max(np.abs(waveform)))
     if peak > 1.0:
         waveform = waveform / peak
@@ -216,7 +356,7 @@ def _synthesize_reference_audio(pm: pretty_midi.PrettyMIDI, *, sdir: Path) -> Pa
         wav_file.setframerate(REFERENCE_SYNTH_SAMPLE_RATE)
         wav_file.writeframes(pcm_i16.tobytes())
 
-    return audio_path
+    return audio_path, "fallback_wave"
 
 
 def _round_coord(v: float) -> float:
@@ -1098,7 +1238,7 @@ async def upload_midi(file: UploadFile = File(...)) -> dict:
     except Exception:
         pass
 
-    reference_audio_path = _synthesize_reference_audio(pm, sdir=sdir)
+    reference_audio_path, reference_audio_renderer = _synthesize_reference_audio(pm, sdir=sdir)
 
     return {
         "sessionId": session_id,
@@ -1118,6 +1258,7 @@ async def upload_midi(file: UploadFile = File(...)) -> dict:
             else None
         ),
         "referenceAudioSampleRate": REFERENCE_SYNTH_SAMPLE_RATE if reference_audio_path is not None else None,
+        "referenceAudioRenderer": reference_audio_renderer,
     }
 
 
