@@ -119,6 +119,41 @@ type PostureTimelinePoint = {
   }>;
 };
 
+type LandmarkXY = { x: number; y: number };
+
+type PoseBodyLandmarks = {
+  leftShoulder: LandmarkXY;
+  rightShoulder: LandmarkXY;
+  leftHip: LandmarkXY;
+  rightHip: LandmarkXY;
+  leftEar: LandmarkXY;
+  rightEar: LandmarkXY;
+} | null;
+
+type HandLandmarks = {
+  label: "left" | "right";
+  wrist: LandmarkXY;
+  indexMcp: LandmarkXY;
+  indexPip: LandmarkXY;
+  middleMcp: LandmarkXY;
+  middlePip: LandmarkXY;
+  indexPipAngleDeg: number | null;
+  wristCollapse: number | null;
+};
+
+type PoseFrame = {
+  frameIndex: number;
+  timestampMs: number;
+  pose: PoseBodyLandmarks;
+  hands: HandLandmarks[];
+  metrics: {
+    torsoSpan: number | null;
+    earShoulderDistance: number | null;
+    maxWristCollapse: number | null;
+    maxFlatFingerAngle: number | null;
+  };
+};
+
 type PoseResponse = {
   sessionId: string;
   sampleFps: number;
@@ -129,6 +164,7 @@ type PoseResponse = {
     flagCount: number;
     byType: Partial<Record<PostureRule, number>>;
   };
+  frames: PoseFrame[];
 };
 
 type TutorDiff = {
@@ -209,6 +245,7 @@ export default function Home() {
   const [postureWarning, setPostureWarning] = useState<string | null>(null);
   const [tutorWarning, setTutorWarning] = useState<string | null>(null);
   const [renderMode, setRenderMode] = useState<"score" | "piano-roll">("score");
+  const [showPoseOverlay, setShowPoseOverlay] = useState(true);
   const performanceVideoRef = useRef<HTMLVideoElement | null>(null);
 
   async function uploadMidi(file: File) {
@@ -456,17 +493,38 @@ export default function Home() {
             <h3 className="text-sm font-semibold text-zinc-800 dark:text-zinc-100">A/B playback</h3>
             <div className="mt-2 grid grid-cols-1 gap-4 md:grid-cols-2">
               <div className="space-y-2">
-                <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">
-                  Your performance
-                </p>
+                <div className="flex items-center justify-between">
+                  <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">
+                    Your performance
+                  </p>
+                  {video?.videoUrl && pose && (
+                    <label className="flex cursor-pointer items-center gap-1.5 text-xs text-zinc-500">
+                      <input
+                        type="checkbox"
+                        checked={showPoseOverlay}
+                        onChange={(e) => setShowPoseOverlay(e.target.checked)}
+                        className="h-3.5 w-3.5"
+                      />
+                      Pose overlay
+                    </label>
+                  )}
+                </div>
                 {video?.videoUrl ? (
-                  <video
-                    ref={performanceVideoRef}
-                    controls
-                    preload="metadata"
-                    src={resolveApiUrl(video.videoUrl)}
-                    className="w-full rounded border border-zinc-200 dark:border-zinc-800"
-                  />
+                  <div className="relative w-full">
+                    <video
+                      ref={performanceVideoRef}
+                      controls
+                      preload="metadata"
+                      src={resolveApiUrl(video.videoUrl)}
+                      className="w-full rounded border border-zinc-200 dark:border-zinc-800"
+                    />
+                    {pose && showPoseOverlay && (
+                      <PoseOverlay
+                        videoRef={performanceVideoRef}
+                        frames={pose.frames}
+                      />
+                    )}
+                  </div>
                 ) : (
                   <p className="text-sm text-zinc-500">Upload performance video to enable scrubbing.</p>
                 )}
@@ -846,6 +904,187 @@ function postureSeverityOpacity(severity: PostureSeverity): number {
 
 function prettyRuleName(rule: PostureRule): string {
   return rule.replaceAll("_", " ");
+}
+
+function PoseOverlay({
+  videoRef,
+  frames,
+}: {
+  videoRef: React.RefObject<HTMLVideoElement | null>;
+  frames: PoseFrame[];
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || frames.length === 0) return;
+
+    function syncCanvasSize() {
+      if (!video || !canvas) return;
+      const dpr = window.devicePixelRatio || 1;
+      const w = video.clientWidth;
+      const h = video.clientHeight;
+      if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+        canvas.width = w * dpr;
+        canvas.height = h * dpr;
+        const ctx = canvas.getContext("2d");
+        if (ctx) ctx.scale(dpr, dpr);
+      }
+    }
+
+    function findNearestFrame(currentMs: number): PoseFrame {
+      let best = frames[0];
+      let bestDiff = Math.abs(frames[0].timestampMs - currentMs);
+      for (let i = 1; i < frames.length; i++) {
+        const diff = Math.abs(frames[i].timestampMs - currentMs);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          best = frames[i];
+        }
+      }
+      return best;
+    }
+
+    function pt(lm: LandmarkXY, w: number, h: number): [number, number] {
+      return [lm.x * w, lm.y * h];
+    }
+
+    function drawFrame() {
+      if (!video || !canvas) return;
+      syncCanvasSize();
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+
+      const dpr = window.devicePixelRatio || 1;
+      const W = canvas.width / dpr;
+      const H = canvas.height / dpr;
+      ctx.clearRect(0, 0, W, H);
+
+      const currentMs = video.currentTime * 1000;
+      const frame = findNearestFrame(currentMs);
+
+      ctx.lineWidth = 2;
+      ctx.lineCap = "round";
+
+      // Body skeleton
+      const pose = frame.pose;
+      if (pose) {
+        const joints: Array<[LandmarkXY, string]> = [
+          [pose.leftEar, "#a78bfa"],
+          [pose.rightEar, "#a78bfa"],
+          [pose.leftShoulder, "#60a5fa"],
+          [pose.rightShoulder, "#60a5fa"],
+          [pose.leftHip, "#34d399"],
+          [pose.rightHip, "#34d399"],
+        ];
+
+        const connections: Array<[LandmarkXY, LandmarkXY]> = [
+          [pose.leftEar, pose.leftShoulder],
+          [pose.rightEar, pose.rightShoulder],
+          [pose.leftShoulder, pose.rightShoulder],
+          [pose.leftShoulder, pose.leftHip],
+          [pose.rightShoulder, pose.rightHip],
+          [pose.leftHip, pose.rightHip],
+        ];
+
+        ctx.strokeStyle = "rgba(255,255,255,0.6)";
+        ctx.lineWidth = 2;
+        for (const [a, b] of connections) {
+          const [ax, ay] = pt(a, W, H);
+          const [bx, by] = pt(b, W, H);
+          ctx.beginPath();
+          ctx.moveTo(ax, ay);
+          ctx.lineTo(bx, by);
+          ctx.stroke();
+        }
+
+        for (const [lm, color] of joints) {
+          const [x, y] = pt(lm, W, H);
+          ctx.beginPath();
+          ctx.arc(x, y, 5, 0, Math.PI * 2);
+          ctx.fillStyle = color;
+          ctx.fill();
+          ctx.strokeStyle = "white";
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+        }
+      }
+
+      // Hand landmarks
+      for (const hand of frame.hands ?? []) {
+        const handColor = hand.label === "left" ? "#fb923c" : "#f472b6";
+        const joints: LandmarkXY[] = [
+          hand.wrist,
+          hand.indexMcp,
+          hand.indexPip,
+          hand.middleMcp,
+          hand.middlePip,
+        ];
+        const chains: Array<LandmarkXY[]> = [
+          [hand.wrist, hand.indexMcp, hand.indexPip],
+          [hand.wrist, hand.middleMcp, hand.middlePip],
+        ];
+
+        ctx.strokeStyle = handColor;
+        ctx.lineWidth = 1.5;
+        for (const chain of chains) {
+          ctx.beginPath();
+          const [sx, sy] = pt(chain[0], W, H);
+          ctx.moveTo(sx, sy);
+          for (let i = 1; i < chain.length; i++) {
+            const [cx, cy] = pt(chain[i], W, H);
+            ctx.lineTo(cx, cy);
+          }
+          ctx.stroke();
+        }
+
+        for (const lm of joints) {
+          const [x, y] = pt(lm, W, H);
+          ctx.beginPath();
+          ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+          ctx.fillStyle = handColor;
+          ctx.fill();
+          ctx.strokeStyle = "white";
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+      }
+    }
+
+    const ro = new ResizeObserver(() => {
+      syncCanvasSize();
+      drawFrame();
+    });
+    ro.observe(video);
+
+    video.addEventListener("timeupdate", drawFrame);
+    video.addEventListener("seeked", drawFrame);
+    video.addEventListener("loadedmetadata", drawFrame);
+
+    drawFrame();
+
+    return () => {
+      video.removeEventListener("timeupdate", drawFrame);
+      video.removeEventListener("seeked", drawFrame);
+      video.removeEventListener("loadedmetadata", drawFrame);
+      ro.disconnect();
+    };
+  }, [videoRef, frames]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        width: "100%",
+        height: "100%",
+        pointerEvents: "none",
+      }}
+    />
+  );
 }
 
 function PostureTimeline({

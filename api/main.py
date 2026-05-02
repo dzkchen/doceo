@@ -1684,6 +1684,7 @@ async def pose(request: Request) -> dict:
         "postureTimeline": posture_timeline,
         "postureSummary": posture_payload["postureSummary"],
         "posturePath": str(posture_path.relative_to(STORAGE.parent)),
+        "frames": frames,
     }
 
 
