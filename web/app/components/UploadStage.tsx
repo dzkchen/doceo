@@ -45,7 +45,7 @@ export function UploadStage({
           </span>
         </h1>
         <p style={{ maxWidth: 640, color: "var(--ink-soft)", fontSize: 16, lineHeight: 1.55, marginTop: 6 }}>
-          Privotr cross-references a reference MIDI with a side-view recording of you at the keyboard —
+          Doceo cross-references a reference MIDI with a side-view recording of you at the keyboard —
           every wrong pitch, missed beat, and slipping shoulder lands in one tidy review.
         </p>
       </div>

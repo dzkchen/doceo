@@ -25,7 +25,7 @@ const jetbrains = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "privotr — a patient ear for solitary practice",
+  title: "Doceo — a patient ear for solitary practice",
   description: "Piano practice analysis: pitch accuracy, timing, posture, and AI tutor feedback.",
   other: {
     "color-scheme": "light",

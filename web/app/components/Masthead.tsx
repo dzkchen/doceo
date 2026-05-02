@@ -8,7 +8,7 @@ type MastheadProps = {
   onReset: () => void;
 };
 
-function PrivotrMark({ size = 28 }: { size?: number }) {
+function DoceoMark({ size = 28 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 32 32" fill="none">
       <ellipse cx="11" cy="22" rx="6" ry="4.5" transform="rotate(-22 11 22)" fill="currentColor" />
@@ -26,13 +26,13 @@ function Wordmark() {
   return (
     <div className="row center-y" style={{ gap: 10 }}>
       <span style={{ color: "var(--ink)" }}>
-        <PrivotrMark size={26} />
+        <DoceoMark size={26} />
       </span>
       <span
         className="serif"
         style={{ fontSize: 24, letterSpacing: "0.005em", fontWeight: 500, color: "var(--ink)" }}
       >
-        privotr<span style={{ color: "var(--vermilion)" }}>.</span>
+        Doceo<span style={{ color: "var(--vermilion)" }}>.</span>
       </span>
     </div>
   );

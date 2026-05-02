@@ -4,7 +4,7 @@ export function Footer() {
       <div className="double-rule" />
       <div className="row between center-y" style={{ paddingTop: 8 }}>
         <span className="serif-i" style={{ color: "var(--ink-mute)", fontSize: 13 }}>
-          &ldquo;What was difficult yesterday is the music of tomorrow.&rdquo; — privotr.
+          &ldquo;What was difficult yesterday is the music of tomorrow.&rdquo; — Doceo.
         </span>
         <div
           className="row gap-2"

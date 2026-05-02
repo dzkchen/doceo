@@ -797,10 +797,12 @@ function applyAlignmentColors(osmd: OsmdLike, annotatedReferenceNotes: Annotated
 
 type NoteTimeEntry = { onset_ms: number; element: SVGGElement };
 
-function bindScoreScrubClicks(
+// Builds the noteTimeMap and applies visual affordances to note groups.
+// Click/seek is handled at the container level (see ScoreView) to avoid
+// pointer-events issues inside OSMD's SVG tree.
+function buildNoteTimeMap(
   osmd: OsmdLike,
   annotatedReferenceNotes: AnnotatedReferenceNote[],
-  onNoteScrub: (ms: number) => void,
 ): NoteTimeEntry[] {
   const sourceNotes = collectSourceNotes(osmd);
   const byRefIdx = new Map(annotatedReferenceNotes.map((n) => [n.refIdx, n]));
@@ -817,14 +819,9 @@ function bindScoreScrubClicks(
     const gn = osmd.EngravingRules?.GNote?.(sn);
     const group = gn?.getSVGGElement?.();
     if (group) {
-      group.style.cursor = "pointer";
-      group.setAttribute("tabindex", "0");
-      group.setAttribute("role", "button");
       const baseText = `${(annotated.onset_ms / 1000).toFixed(2)}s`;
       const statusHint = annotated.status !== "correct" ? ` · ${annotated.status}` : "";
       group.setAttribute("title", dynamicHint ? `${baseText} · ${dynamicHint}` : `${baseText}${statusHint}`);
-      group.onclick = () => onNoteScrub(annotated.onset_ms);
-      group.onkeydown = (e: KeyboardEvent) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onNoteScrub(annotated.onset_ms); } };
       entries.push({ onset_ms: annotated.onset_ms, element: group });
     }
     refIdx++;
@@ -841,21 +838,31 @@ function ScoreView({
   onNoteScrub: (ms: number) => void;
   videoRef?: React.RefObject<HTMLVideoElement | null>;
 }) {
-  const containerRef = useRef<HTMLDivElement>(null);
+  // outerRef  — scroll container + click target; position:relative for cursor
+  // osmdRef   — div OSMD renders into (innerHTML cleared on re-render)
+  // cursorRef — the red vertical line div
+  const outerRef  = useRef<HTMLDivElement>(null);
+  const osmdRef   = useRef<HTMLDivElement>(null);
+  const cursorRef = useRef<HTMLDivElement>(null);
   const noteTimeMapRef = useRef<NoteTimeEntry[]>([]);
-  const cursorLineRef = useRef<SVGLineElement | null>(null);
-  const cursorSvgRef = useRef<SVGSVGElement | null>(null);
 
+  // Keep a stable ref to onNoteScrub so the click/cursor effects don't re-register
+  const onNoteScrubRef = useRef(onNoteScrub);
+  useEffect(() => { onNoteScrubRef.current = onNoteScrub; });
+
+  // OSMD rendering
   useEffect(() => {
-    if (!containerRef.current) return;
-    const container = containerRef.current;
+    const osmdContainer = osmdRef.current;
+    if (!osmdContainer) return;
     let cancelled = false;
     noteTimeMapRef.current = [];
+    if (cursorRef.current) cursorRef.current.style.display = "none";
+
     (async () => {
       const mod = await import("opensheetmusicdisplay");
       if (cancelled) return;
-      container.innerHTML = "";
-      const inst = new mod.OpenSheetMusicDisplay(container, { autoResize: true, backend: "svg", drawTitle: true });
+      osmdContainer.innerHTML = "";
+      const inst = new mod.OpenSheetMusicDisplay(osmdContainer, { autoResize: true, backend: "svg", drawTitle: true });
       try {
         await inst.load(musicxml);
         if (cancelled) return;
@@ -863,67 +870,78 @@ function ScoreView({
         inst.render();
         if (annotatedReferenceNotes?.length) {
           applyAlignmentColors(inst as unknown as OsmdLike, annotatedReferenceNotes, "post-render");
-          noteTimeMapRef.current = bindScoreScrubClicks(inst as unknown as OsmdLike, annotatedReferenceNotes, onNoteScrub);
+          noteTimeMapRef.current = buildNoteTimeMap(inst as unknown as OsmdLike, annotatedReferenceNotes);
         }
       } catch (e) {
-        container.innerHTML = `<p style="color:var(--vermilion)">Failed to render score: ${(e as Error).message}</p>`;
+        osmdContainer.innerHTML = `<p style="color:var(--vermilion)">Failed to render score: ${(e as Error).message}</p>`;
         onColoringFailure();
       }
     })();
+
     return () => {
       cancelled = true;
       noteTimeMapRef.current = [];
-      cursorLineRef.current = null;
-      cursorSvgRef.current = null;
-      container.innerHTML = "";
+      if (cursorRef.current) cursorRef.current.style.display = "none";
+      osmdContainer.innerHTML = "";
     };
-  }, [musicxml, annotatedReferenceNotes, onColoringFailure, onNoteScrub]);
+  }, [musicxml, annotatedReferenceNotes, onColoringFailure]);
 
-  // Cursor tracking — listens to video timeupdate and moves a line in the OSMD SVG
+  // Container-level click → seek nearest note.
+  // Using a container handler bypasses any pointer-events:none on OSMD's SVG elements.
+  useEffect(() => {
+    const outer = outerRef.current;
+    if (!outer) return;
+
+    function handleClick(e: MouseEvent) {
+      const map = noteTimeMapRef.current;
+      if (!map.length) return;
+      const outerRect = outer!.getBoundingClientRect();
+      // Convert viewport click x to scroll-content x
+      const clickX = e.clientX - outerRect.left + outer!.scrollLeft;
+
+      let bestNote = map[0];
+      let bestDist = Infinity;
+      for (const entry of map) {
+        const r = entry.element.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) continue;
+        const entryX = r.left + r.width / 2 - outerRect.left + outer!.scrollLeft;
+        const dist = Math.abs(entryX - clickX);
+        if (dist < bestDist) { bestDist = dist; bestNote = entry; }
+      }
+      onNoteScrubRef.current(bestNote.onset_ms);
+    }
+
+    outer.addEventListener("click", handleClick);
+    return () => outer.removeEventListener("click", handleClick);
+  }, []); // stable — reads only refs
+
+  // Cursor tracking: moves the red div to the current note's screen x on each timeupdate
   useEffect(() => {
     const video = videoRef?.current;
     if (!video) return;
-
     let rafId: number | null = null;
 
     function moveCursor() {
       const map = noteTimeMapRef.current;
-      if (!map.length) return;
-      const currentMs = video!.currentTime * 1000;
+      const outer = outerRef.current;
+      const cursor = cursorRef.current;
+      if (!map.length || !outer || !cursor) return;
 
-      // Binary-search for last note whose onset <= currentMs
+      const currentMs = video!.currentTime * 1000;
       let lo = 0, hi = map.length - 1;
       while (lo < hi) {
         const mid = (lo + hi + 1) >> 1;
         if (map[mid].onset_ms <= currentMs) lo = mid; else hi = mid - 1;
       }
-      const noteEl = map[lo].element;
-      const ownerSvg = noteEl.ownerSVGElement;
-      if (!ownerSvg) return;
 
-      // Move cursor element to the correct SVG if the system changed
-      if (cursorSvgRef.current !== ownerSvg) {
-        if (cursorLineRef.current && cursorSvgRef.current) {
-          try { cursorSvgRef.current.removeChild(cursorLineRef.current); } catch { /* already removed */ }
-        }
-        if (!cursorLineRef.current) {
-          const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-          line.setAttribute("stroke", "rgba(192,52,29,0.65)");
-          line.setAttribute("stroke-width", "1.5");
-          line.style.pointerEvents = "none";
-          cursorLineRef.current = line;
-        }
-        ownerSvg.appendChild(cursorLineRef.current);
-        cursorSvgRef.current = ownerSvg;
-      }
+      const noteRect = map[lo].element.getBoundingClientRect();
+      if (noteRect.width === 0 && noteRect.height === 0) return;
 
-      const bbox = noteEl.getBBox();
-      const noteX = String(bbox.x + bbox.width / 2);
-      const svgH = String(ownerSvg.viewBox?.baseVal?.height || ownerSvg.clientHeight || 9999);
-      cursorLineRef.current!.setAttribute("x1", noteX);
-      cursorLineRef.current!.setAttribute("x2", noteX);
-      cursorLineRef.current!.setAttribute("y1", "0");
-      cursorLineRef.current!.setAttribute("y2", svgH);
+      const outerRect = outer.getBoundingClientRect();
+      // Content x (accounts for horizontal scroll)
+      const noteX = noteRect.left + noteRect.width / 2 - outerRect.left + outer.scrollLeft;
+      cursor.style.left = `${noteX - 1}px`;
+      cursor.style.display = "block";
     }
 
     function onTimeUpdate() {
@@ -935,25 +953,38 @@ function ScoreView({
     return () => {
       video.removeEventListener("timeupdate", onTimeUpdate);
       if (rafId !== null) cancelAnimationFrame(rafId);
-      if (cursorLineRef.current && cursorSvgRef.current) {
-        try { cursorSvgRef.current.removeChild(cursorLineRef.current); } catch { /* already removed */ }
-        cursorLineRef.current = null;
-        cursorSvgRef.current = null;
-      }
+      if (cursorRef.current) cursorRef.current.style.display = "none";
     };
   }, [videoRef]);
 
   return (
     <div
-      ref={containerRef}
+      ref={outerRef}
       style={{
+        position: "relative",
         overflowX: "auto",
         background: "#fefaf0",
         border: "1px solid var(--paper-edge)",
-        padding: "28px 32px",
         borderRadius: 2,
+        cursor: "pointer",
       }}
-    />
+    >
+      <div ref={osmdRef} style={{ padding: "28px 32px" }} />
+      {/* Cursor line — HTML div to avoid SVG coordinate system issues */}
+      <div
+        ref={cursorRef}
+        style={{
+          position: "absolute",
+          top: 0,
+          bottom: 0,
+          width: 2,
+          background: "rgba(192,52,29,0.7)",
+          pointerEvents: "none",
+          display: "none",
+          left: 0,
+        }}
+      />
+    </div>
   );
 }
 

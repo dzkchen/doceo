@@ -130,7 +130,7 @@ function Waveform() {
   const [seed, setSeed] = useState(0);
 
   useEffect(() => {
-    const t = setInterval(() => setSeed((s) => s + 1), 120);
+    const t = setInterval(() => setSeed((s) => s + 1), 150);
     return () => clearInterval(t);
   }, []);
 
@@ -138,7 +138,7 @@ function Waveform() {
   const heights = useMemo(() => {
     const out: number[] = [];
     for (let i = 0; i < bars; i++) {
-      const x = (i / bars) * Math.PI * 4 + seed * 0.18;
+      const x = (i / bars) * Math.PI * 4 + seed * 0.14;
       const h =
         Math.abs(Math.sin(x)) * 0.6 +
         Math.abs(Math.sin(x * 2.3 + 1.1)) * 0.35 +
@@ -146,7 +146,7 @@ function Waveform() {
       out.push(h);
     }
     return out;
-  }, [seed]);
+  }, [bars, seed]);
 
   return (
     <div className="row" style={{ height: 64, alignItems: "center", gap: 2 }}>
