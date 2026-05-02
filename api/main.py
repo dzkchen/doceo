@@ -1,11 +1,13 @@
 
+import json
 import shutil
 import subprocess
 import uuid
 from pathlib import Path
 
 import pretty_midi
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from basic_pitch.inference import ICASSP_2022_MODEL_PATH, predict as bp_predict
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from music21 import converter
 
@@ -131,4 +133,85 @@ async def upload_video(
         "videoPath": str(video_path.relative_to(STORAGE.parent)),
         "audioPath": str(audio_path.relative_to(STORAGE.parent)),
         "audioSampleRate": 22050,
+    }
+
+
+@app.post("/analyze")
+async def analyze(request: Request) -> dict:
+    session_id: str | None = None
+    content_type = request.headers.get("content-type", "").lower()
+    if "application/json" in content_type:
+        body = await request.json()
+        if isinstance(body, dict):
+            raw_id = body.get("sessionId") or body.get("session_id")
+            if isinstance(raw_id, str):
+                session_id = raw_id
+    else:
+        form = await request.form()
+        raw_id = form.get("sessionId") or form.get("session_id")
+        if isinstance(raw_id, str):
+            session_id = raw_id
+
+    if not session_id:
+        raise HTTPException(400, "missing sessionId")
+
+    sdir = _session_dir(session_id)
+    audio_path = sdir / "performance.wav"
+    if not audio_path.exists():
+        raise HTTPException(400, "no audio found for session; upload video first")
+
+    try:
+        _model_output, midi_data, _note_events = bp_predict(
+            str(audio_path),
+            model_or_model_path=str(ICASSP_2022_MODEL_PATH.with_suffix(".onnx")),
+            onset_threshold=0.5,
+            frame_threshold=0.5,
+            minimum_note_length=100,
+            minimum_frequency=80.0,
+            maximum_frequency=2000.0,
+            melodia_trick=False,
+            multiple_pitch_bends=False,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"basic-pitch failed: {e}")
+
+    played_notes = sorted(
+        [
+            {
+                "pitch": int(n.pitch),
+                "onset_ms": int(n.start * 1000),
+                "duration_ms": int((n.end - n.start) * 1000),
+                "velocity": int(n.velocity),
+            }
+            for inst in midi_data.instruments
+            if not inst.is_drum
+            for n in inst.notes
+        ],
+        key=lambda x: (x["onset_ms"], x["pitch"]),
+    )
+
+    played_path = sdir / "played.json"
+    played_path.write_text(
+        json.dumps(
+            {
+                "sessionId": session_id,
+                "playedNotes": played_notes,
+                "noteCount": len(played_notes),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+    transcription_path = sdir / "performance.transcribed.mid"
+    midi_data.write(str(transcription_path))
+
+    return {
+        "sessionId": session_id,
+        "playedNotes": played_notes,
+        "noteCount": len(played_notes),
+        "playedPath": str(played_path.relative_to(STORAGE.parent)),
+        "transcribedMidiPath": str(transcription_path.relative_to(STORAGE.parent)),
+        "durationMs": int(midi_data.get_end_time() * 1000),
     }
