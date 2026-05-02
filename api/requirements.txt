@@ -11,9 +11,10 @@ music21>=9.1
 
 # Step 10: audio-to-MIDI transcription
 basic-pitch[onnx]>=0.4.0
+fastdtw>=0.3.4
+mediapipe>=0.10.0
 # basic-pitch -> resampy still imports pkg_resources, which setuptools 81+ removed.
 setuptools<81
 
-# Step 19: tutor pipeline
-anthropic>=0.97.0
+# Step 19: tutor pipeline (Gemini over HTTP + ElevenLabs TTS)
 elevenlabs>=2.20.0

@@ -1,8 +1,21 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+const STATUS_COLORS: Record<Exclude<AnnotatedStatus, "correct">, string> = {
+  wrongPitch: "#dc2626",
+  missed: "#9ca3af",
+  extra: "#f97316",
+};
+
+const POSTURE_RULE_COLORS = {
+  slouched_back: "#2563eb",
+  raised_shoulders: "#f59e0b",
+  collapsed_wrist: "#ef4444",
+  flat_fingers: "#8b5cf6",
+} as const;
 
 type ReferenceNote = {
   pitch: number;
@@ -26,17 +39,167 @@ type VideoResponse = {
   audioPath: string;
 };
 
+type PlayedNote = {
+  pitch: number;
+  onset_ms: number;
+  duration_ms: number;
+  velocity: number;
+};
+
+type AnalyzeResponse = {
+  sessionId: string;
+  noteCount: number;
+  playedNotes: PlayedNote[];
+};
+
+type AnnotatedStatus = "correct" | "wrongPitch" | "missed" | "extra";
+
+type AnnotatedReferenceNote = {
+  refIdx: number;
+  pitch: number;
+  onset_ms: number;
+  duration_ms: number;
+  velocity: number;
+  status: AnnotatedStatus;
+  playedIdx: number | null;
+  timingStatus: "on-time" | "early" | "late" | null;
+  timingDeltaMs: number | null;
+  pitchDelta: number | null;
+};
+
+type AlignmentSummary = {
+  correct: number;
+  wrongPitch: number;
+  missed: number;
+  extra: number;
+  matched: number;
+  referenceCount: number;
+  playedCount: number;
+  timingThresholdMs: number;
+  early: number;
+  late: number;
+  onTime: number;
+  tempoDeviationPct: number | null;
+};
+
+type AlignResponse = {
+  sessionId: string;
+  annotatedReferenceNotes: AnnotatedReferenceNote[];
+  summary: AlignmentSummary;
+};
+
+type PostureSeverity = "mild" | "moderate" | "severe";
+type PostureRule = keyof typeof POSTURE_RULE_COLORS;
+
+type PostureFlag = {
+  type: PostureRule;
+  startMs: number;
+  endMs: number;
+  severity: PostureSeverity;
+  peakScore: number;
+};
+
+type PostureTimelinePoint = {
+  timestampMs: number;
+  flags: Array<{
+    type: PostureRule;
+    severity: PostureSeverity;
+    score: number;
+  }>;
+};
+
+type PoseResponse = {
+  sessionId: string;
+  sampleFps: number;
+  sampledFrameCount: number;
+  postureFlags: PostureFlag[];
+  postureTimeline: PostureTimelinePoint[];
+  postureSummary: {
+    flagCount: number;
+    byType: Partial<Record<PostureRule, number>>;
+  };
+};
+
+type TutorDiff = {
+  piece: string;
+  wrongNotes: Array<{
+    timeSec: number;
+    expected: string;
+    played: string;
+    timingStatus: "on-time" | "early" | "late" | null;
+    timingDeltaMs: number | null;
+  }>;
+  missedNotes: Array<{
+    timeSec: number;
+    expected: string;
+  }>;
+  extraNotes: Array<{
+    timeSec: number;
+    played: string;
+  }>;
+  tempoDeviationPct: number | null;
+  dynamicsDeltas: Array<{
+    timeSec: number;
+    expectedVelocity: number;
+    playedVelocity: number;
+    delta: number;
+    label: string;
+  }>;
+  postureFlags: Array<{
+    type: string;
+    atSec: number;
+    endSec: number;
+    severity: PostureSeverity;
+  }>;
+};
+
+type TutorResponse = {
+  sessionId: string;
+  piece: string;
+  diff: TutorDiff;
+  tutorScript: string;
+  audioPath: string;
+  audioUrl: string;
+  model: {
+    provider: string;
+    model: string;
+  };
+  voice: {
+    voiceId: string;
+  };
+};
+
+function resolveApiUrl(path: string): string {
+  if (path.startsWith("http://") || path.startsWith("https://")) {
+    return path;
+  }
+  return `${API_BASE}${path}`;
+}
+
 export default function Home() {
   const [midi, setMidi] = useState<MidiResponse | null>(null);
   const [video, setVideo] = useState<VideoResponse | null>(null);
-  const [busy, setBusy] = useState<"midi" | "video" | null>(null);
+  const [alignment, setAlignment] = useState<AlignResponse | null>(null);
+  const [playedNotes, setPlayedNotes] = useState<PlayedNote[] | null>(null);
+  const [pose, setPose] = useState<PoseResponse | null>(null);
+  const [tutor, setTutor] = useState<TutorResponse | null>(null);
+  const [busy, setBusy] = useState<"midi" | "video" | "analyze" | "tutor" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [postureWarning, setPostureWarning] = useState<string | null>(null);
+  const [tutorWarning, setTutorWarning] = useState<string | null>(null);
+  const [renderMode, setRenderMode] = useState<"score" | "piano-roll">("score");
 
   async function uploadMidi(file: File) {
     setBusy("midi");
     setError(null);
+    setPostureWarning(null);
+    setAlignment(null);
+    setPlayedNotes(null);
+    setPose(null);
+    setTutor(null);
     setVideo(null);
     setMidi(null);
+    setTutorWarning(null);
     try {
       const fd = new FormData();
       fd.append("file", file);
@@ -44,7 +207,7 @@ export default function Home() {
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}: ${await res.text()}`);
       }
-      setMidi(await res.json());
+      setMidi((await res.json()) as MidiResponse);
     } catch (e) {
       setError(`MIDI upload failed: ${(e as Error).message}`);
     } finally {
@@ -56,6 +219,12 @@ export default function Home() {
     if (!midi) return;
     setBusy("video");
     setError(null);
+    setPostureWarning(null);
+    setAlignment(null);
+    setPlayedNotes(null);
+    setPose(null);
+    setTutor(null);
+    setTutorWarning(null);
     try {
       const fd = new FormData();
       fd.append("session_id", midi.sessionId);
@@ -64,13 +233,99 @@ export default function Home() {
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}: ${await res.text()}`);
       }
-      setVideo(await res.json());
+      setVideo((await res.json()) as VideoResponse);
     } catch (e) {
       setError(`Video upload failed: ${(e as Error).message}`);
     } finally {
       setBusy(null);
     }
   }
+
+  async function runAnalysis() {
+    if (!midi || !video) return;
+    setBusy("analyze");
+    setError(null);
+    setPostureWarning(null);
+    setAlignment(null);
+    setPlayedNotes(null);
+    setPose(null);
+    setTutor(null);
+    setTutorWarning(null);
+    try {
+      const analyzeRes = await fetch(`${API_BASE}/analyze`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId: midi.sessionId }),
+      });
+      if (!analyzeRes.ok) {
+        throw new Error(`Analyze failed (${analyzeRes.status}): ${await analyzeRes.text()}`);
+      }
+      const analyze = (await analyzeRes.json()) as AnalyzeResponse;
+      setPlayedNotes(analyze.playedNotes);
+
+      const alignRes = await fetch(`${API_BASE}/align`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId: midi.sessionId }),
+      });
+      if (!alignRes.ok) {
+        throw new Error(`Align failed (${alignRes.status}): ${await alignRes.text()}`);
+      }
+      setAlignment((await alignRes.json()) as AlignResponse);
+
+      const poseRes = await fetch(`${API_BASE}/pose`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId: midi.sessionId }),
+      });
+      if (!poseRes.ok) {
+        const detail = (await poseRes.text()).slice(0, 180);
+        setPostureWarning(`Posture analysis unavailable (${poseRes.status}): ${detail}`);
+      } else {
+        setPose((await poseRes.json()) as PoseResponse);
+      }
+    } catch (e) {
+      setError(`Analysis failed: ${(e as Error).message}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function generateTutorFeedback() {
+    if (!midi || !alignment) return;
+    setBusy("tutor");
+    setError(null);
+    setTutorWarning(null);
+    try {
+      const tutorRes = await fetch(`${API_BASE}/tutor`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId: midi.sessionId }),
+      });
+      if (!tutorRes.ok) {
+        throw new Error(`Tutor failed (${tutorRes.status}): ${await tutorRes.text()}`);
+      }
+      setTutor((await tutorRes.json()) as TutorResponse);
+    } catch (e) {
+      setTutorWarning(`Tutor feedback unavailable: ${(e as Error).message}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const redCount = alignment ? alignment.summary.wrongPitch : 0;
+  const analysisDurationMs = useMemo(() => {
+    const midiDuration = midi?.durationMs ?? 0;
+    const playedDuration = (playedNotes ?? []).reduce(
+      (max, note) => Math.max(max, note.onset_ms + note.duration_ms),
+      0,
+    );
+    const postureDuration = pose?.postureTimeline.reduce(
+      (max, point) => Math.max(max, point.timestampMs),
+      0,
+    ) ?? 0;
+    return Math.max(1, midiDuration, playedDuration, postureDuration);
+  }, [midi?.durationMs, playedNotes, pose?.postureTimeline]);
 
   return (
     <main className="mx-auto max-w-5xl space-y-6 p-8 font-sans">
@@ -84,6 +339,16 @@ export default function Home() {
       {error && (
         <div className="rounded border border-red-300 bg-red-50 p-3 text-sm text-red-800">
           {error}
+        </div>
+      )}
+      {postureWarning && (
+        <div className="rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
+          {postureWarning}
+        </div>
+      )}
+      {tutorWarning && (
+        <div className="rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
+          {tutorWarning}
         </div>
       )}
 
@@ -121,27 +386,105 @@ export default function Home() {
 
       <section>
         <button
-          disabled={!midi || !video}
+          disabled={!midi || !video || busy !== null}
           className="rounded bg-black px-4 py-2 text-white disabled:cursor-not-allowed disabled:opacity-30 dark:bg-white dark:text-black"
-          onClick={() => {
-            console.log("ready to analyze", midi?.sessionId);
-          }}
+          onClick={runAnalysis}
         >
-          Start analysis
+          {busy === "analyze" ? "Analyzing…" : "Start analysis"}
         </button>
-        {midi && video && (
-          <p className="mt-2 text-sm text-zinc-500">
-            Analysis pipeline lands in step 11. Session: {midi.sessionId}
+        {midi && video && !alignment && (
+          <p className="mt-2 text-sm text-zinc-500">Ready to analyze session: {midi.sessionId}</p>
+        )}
+        {alignment && (
+          <p className="mt-2 text-sm text-zinc-600">
+            Alignment: {alignment.summary.correct} correct, {alignment.summary.wrongPitch} wrong pitch,
+            {" "}{alignment.summary.missed} missed, {alignment.summary.extra} extra, tempo deviation{" "}
+            {alignment.summary.tempoDeviationPct === null
+              ? "n/a"
+              : `${alignment.summary.tempoDeviationPct.toFixed(1)}%`}.
           </p>
+        )}
+        {alignment && (
+          <p className="mt-1 text-sm text-zinc-600">
+            Timing (±{alignment.summary.timingThresholdMs}ms): {alignment.summary.onTime} on-time, {alignment.summary.early} early, {alignment.summary.late} late.
+          </p>
+        )}
+        {pose && (
+          <p className="mt-1 text-sm text-zinc-600">
+            Posture flags: {pose.postureSummary.flagCount} total across {pose.sampledFrameCount} sampled frames at ~{pose.sampleFps.toFixed(1)}fps.
+          </p>
+        )}
+        {alignment && (
+          <div className="mt-3 space-y-2 rounded border border-zinc-200 p-3 dark:border-zinc-800">
+            <button
+              disabled={busy !== null}
+              className="rounded bg-zinc-900 px-3 py-2 text-sm text-white disabled:cursor-not-allowed disabled:opacity-30 dark:bg-zinc-100 dark:text-zinc-900"
+              onClick={generateTutorFeedback}
+            >
+              {busy === "tutor"
+                ? "Generating tutor feedback…"
+                : tutor
+                  ? "Regenerate tutor feedback"
+                  : "Play tutor feedback"}
+            </button>
+            {tutor && (
+              <>
+                <p className="text-sm text-zinc-600">
+                  Voice tutor ({tutor.model.provider} / {tutor.model.model}) ready.
+                </p>
+                <audio controls preload="metadata" src={resolveApiUrl(tutor.audioUrl)} className="w-full" />
+                <p className="text-sm text-zinc-700">{tutor.tutorScript}</p>
+              </>
+            )}
+          </div>
         )}
       </section>
 
       <section>
-        <h2 className="mb-2 text-xl font-semibold">Score</h2>
-        {midi?.musicxml ? (
-          <ScoreView musicxml={midi.musicxml} />
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <h2 className="text-xl font-semibold">Score</h2>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setRenderMode("score")}
+              className={`rounded px-3 py-1 text-sm ${renderMode === "score" ? "bg-black text-white dark:bg-white dark:text-black" : "bg-zinc-200 text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200"}`}
+            >
+              OSMD
+            </button>
+            <button
+              onClick={() => setRenderMode("piano-roll")}
+              className={`rounded px-3 py-1 text-sm ${renderMode === "piano-roll" ? "bg-black text-white dark:bg-white dark:text-black" : "bg-zinc-200 text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200"}`}
+            >
+              Piano Roll
+            </button>
+          </div>
+        </div>
+
+        {renderMode === "score" && midi?.musicxml ? (
+          <ScoreView
+            musicxml={midi.musicxml}
+            annotatedReferenceNotes={alignment?.annotatedReferenceNotes ?? null}
+            onColoringFailure={() => setRenderMode("piano-roll")}
+          />
+        ) : renderMode === "piano-roll" && midi ? (
+          <PianoRollView
+            referenceNotes={midi.referenceNotes}
+            annotatedReferenceNotes={alignment?.annotatedReferenceNotes ?? null}
+            playedNotes={playedNotes}
+          />
         ) : (
           <p className="text-zinc-400">Upload a MIDI to see the score render here.</p>
+        )}
+
+        {alignment && redCount > 0 && (
+          <p className="mt-2 text-sm text-zinc-600">
+            Done condition check: {redCount} red wrong-pitch notes detected.
+          </p>
+        )}
+        {pose && (
+          <PostureTimeline
+            totalDurationMs={analysisDurationMs}
+            postureFlags={pose.postureFlags}
+          />
         )}
       </section>
     </main>
@@ -177,14 +520,20 @@ function UploadCard(props: {
       />
       {loading && <p className="mt-2 text-sm text-zinc-500">Uploading…</p>}
       {status && <p className="mt-2 text-sm text-emerald-700">{status}</p>}
-      {hint && !status && !loading && (
-        <p className="mt-2 text-sm text-zinc-400">{hint}</p>
-      )}
+      {hint && !status && !loading && <p className="mt-2 text-sm text-zinc-400">{hint}</p>}
     </div>
   );
 }
 
-function ScoreView({ musicxml }: { musicxml: string }) {
+function ScoreView({
+  musicxml,
+  annotatedReferenceNotes,
+  onColoringFailure,
+}: {
+  musicxml: string;
+  annotatedReferenceNotes: AnnotatedReferenceNote[] | null;
+  onColoringFailure: () => void;
+}) {
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -204,12 +553,19 @@ function ScoreView({ musicxml }: { musicxml: string }) {
       try {
         await inst.load(musicxml);
         if (cancelled) return;
+        if (annotatedReferenceNotes?.length) {
+          applyAlignmentColors(inst as unknown as OsmdLike, annotatedReferenceNotes, "pre-render");
+        }
         inst.render();
+        if (annotatedReferenceNotes?.length) {
+          applyAlignmentColors(inst as unknown as OsmdLike, annotatedReferenceNotes, "post-render");
+        }
       } catch (e) {
         console.error("OSMD load/render failed", e);
-        container.innerHTML = `<p style="color:#b91c1c">Failed to render score: ${
+        container.innerHTML = `<p style=\"color:#b91c1c\">Failed to render score: ${
           (e as Error).message
         }</p>`;
+        onColoringFailure();
       }
     })();
 
@@ -217,12 +573,274 @@ function ScoreView({ musicxml }: { musicxml: string }) {
       cancelled = true;
       container.innerHTML = "";
     };
-  }, [musicxml]);
+  }, [musicxml, annotatedReferenceNotes, onColoringFailure]);
 
   return (
     <div
       ref={ref}
       className="overflow-auto rounded border border-zinc-200 bg-white p-4 dark:border-zinc-800"
     />
+  );
+}
+
+type OsmdLike = {
+  Sheet?: {
+    SourceMeasures?: Array<{
+      VerticalSourceStaffEntryContainers?: Array<{
+        StaffEntries?: Array<{
+          VoiceEntries?: Array<{
+            Notes?: unknown[];
+          } | null>;
+        } | null>;
+      }>;
+    }>;
+  };
+  EngravingRules?: {
+    GNote?: (sourceNote: unknown) => {
+      setColor?: (
+        color: string,
+        options: {
+          applyToNoteheads: boolean;
+          applyToStem: boolean;
+          applyToBeams: boolean;
+          applyToFlag: boolean;
+          applyToLedgerLines: boolean;
+          applyToModifiers: boolean;
+          applyToTies: boolean;
+          applyToSlurs: boolean;
+        },
+      ) => void;
+    } | null;
+  };
+};
+
+function applyAlignmentColors(
+  osmd: OsmdLike,
+  annotatedReferenceNotes: AnnotatedReferenceNote[],
+  phase: "pre-render" | "post-render",
+) {
+  const sourceNotes: unknown[] = [];
+  const sourceMeasures = osmd.Sheet?.SourceMeasures ?? [];
+
+  for (const measure of sourceMeasures) {
+    for (const verticalContainer of measure.VerticalSourceStaffEntryContainers ?? []) {
+      for (const staffEntry of verticalContainer.StaffEntries ?? []) {
+        if (!staffEntry) continue;
+        for (const voiceEntry of staffEntry.VoiceEntries ?? []) {
+          if (!voiceEntry) continue;
+          for (const note of voiceEntry.Notes ?? []) {
+            sourceNotes.push(note);
+          }
+        }
+      }
+    }
+  }
+
+  const statusByRefIdx = new Map<number, AnnotatedStatus>(
+    annotatedReferenceNotes.map((note) => [note.refIdx, note.status]),
+  );
+
+  let refIdx = 0;
+  for (const sourceNote of sourceNotes) {
+    if (typeof sourceNote === "object" && sourceNote && "isRest" in sourceNote) {
+      const restNote = sourceNote as { isRest?: () => boolean };
+      if (typeof restNote.isRest === "function" && restNote.isRest()) {
+        continue;
+      }
+    }
+
+    const status = statusByRefIdx.get(refIdx);
+    if (status && status !== "correct") {
+      const color = STATUS_COLORS[status];
+      const note = sourceNote as {
+        NoteheadColor?: string;
+        ParentVoiceEntry?: { StemColor?: string };
+      };
+      if (phase === "pre-render") {
+        note.NoteheadColor = color;
+        if (note.ParentVoiceEntry) {
+          note.ParentVoiceEntry.StemColor = color;
+        }
+      } else {
+        const graphicalNote = osmd.EngravingRules?.GNote?.(sourceNote);
+        graphicalNote?.setColor?.(color, {
+          applyToNoteheads: true,
+          applyToStem: true,
+          applyToBeams: true,
+          applyToFlag: true,
+          applyToLedgerLines: true,
+          applyToModifiers: true,
+          applyToTies: false,
+          applyToSlurs: false,
+        });
+      }
+    }
+    refIdx += 1;
+  }
+}
+
+function postureSeverityOpacity(severity: PostureSeverity): number {
+  if (severity === "severe") return 0.95;
+  if (severity === "moderate") return 0.75;
+  return 0.55;
+}
+
+function prettyRuleName(rule: PostureRule): string {
+  return rule.replaceAll("_", " ");
+}
+
+function PostureTimeline({
+  totalDurationMs,
+  postureFlags,
+}: {
+  totalDurationMs: number;
+  postureFlags: PostureFlag[];
+}) {
+  const lanes: PostureRule[] = [
+    "slouched_back",
+    "raised_shoulders",
+    "collapsed_wrist",
+    "flat_fingers",
+  ];
+
+  return (
+    <div className="mt-4 rounded border border-zinc-200 bg-white p-4 dark:border-zinc-800">
+      <h3 className="text-sm font-semibold text-zinc-800 dark:text-zinc-100">Posture Timeline</h3>
+      <p className="mt-1 text-xs text-zinc-500">
+        Colored blocks are time-aligned posture flags from the video.
+      </p>
+
+      <div className="mt-3 space-y-2">
+        {lanes.map((lane) => {
+          const laneFlags = postureFlags.filter((flag) => flag.type === lane);
+          return (
+            <div key={lane} className="grid grid-cols-[140px_1fr] items-center gap-3">
+              <span className="text-xs capitalize text-zinc-600 dark:text-zinc-300">
+                {prettyRuleName(lane)}
+              </span>
+              <div className="relative h-6 rounded bg-zinc-100 dark:bg-zinc-900">
+                {laneFlags.map((flag, idx) => {
+                  const leftPct = (flag.startMs / totalDurationMs) * 100;
+                  const widthPct = Math.max(
+                    0.8,
+                    ((flag.endMs - flag.startMs) / totalDurationMs) * 100,
+                  );
+                  return (
+                    <div
+                      key={`${lane}-${idx}`}
+                      className="absolute top-0 h-6 rounded"
+                      style={{
+                        left: `${leftPct}%`,
+                        width: `${widthPct}%`,
+                        background: POSTURE_RULE_COLORS[lane],
+                        opacity: postureSeverityOpacity(flag.severity),
+                      }}
+                      title={`${prettyRuleName(flag.type)} · ${flag.severity} · ${(flag.startMs / 1000).toFixed(1)}s - ${(flag.endMs / 1000).toFixed(1)}s`}
+                    />
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {postureFlags.length === 0 && (
+        <p className="mt-2 text-xs text-zinc-500">No posture flags detected for this take.</p>
+      )}
+    </div>
+  );
+}
+
+function PianoRollView({
+  referenceNotes,
+  annotatedReferenceNotes,
+  playedNotes,
+}: {
+  referenceNotes: ReferenceNote[];
+  annotatedReferenceNotes: AnnotatedReferenceNote[] | null;
+  playedNotes: PlayedNote[] | null;
+}) {
+  const width = 980;
+  const height = 360;
+  const padX = 22;
+  const padY = 18;
+
+  const statusByRefIdx = useMemo(
+    () => new Map((annotatedReferenceNotes ?? []).map((n) => [n.refIdx, n.status])),
+    [annotatedReferenceNotes],
+  );
+
+  const maxTime = useMemo(() => {
+    const refMax = referenceNotes.reduce((acc, n) => Math.max(acc, n.onset + n.duration), 0);
+    const playedMax = (playedNotes ?? []).reduce(
+      (acc, n) => Math.max(acc, n.onset_ms + n.duration_ms),
+      0,
+    );
+    return Math.max(refMax, playedMax, 1);
+  }, [referenceNotes, playedNotes]);
+
+  const minPitch = useMemo(() => {
+    const refMin = referenceNotes.reduce((acc, n) => Math.min(acc, n.pitch), 127);
+    const playedMin = (playedNotes ?? []).reduce((acc, n) => Math.min(acc, n.pitch), 127);
+    return Math.min(refMin, playedMin);
+  }, [referenceNotes, playedNotes]);
+
+  const maxPitch = useMemo(() => {
+    const refMax = referenceNotes.reduce((acc, n) => Math.max(acc, n.pitch), 0);
+    const playedMax = (playedNotes ?? []).reduce((acc, n) => Math.max(acc, n.pitch), 0);
+    return Math.max(refMax, playedMax);
+  }, [referenceNotes, playedNotes]);
+
+  const pitchSpan = Math.max(1, maxPitch - minPitch);
+  const drawW = width - padX * 2;
+  const drawH = height - padY * 2;
+
+  return (
+    <div className="rounded border border-zinc-200 bg-white p-4 dark:border-zinc-800">
+      <svg width="100%" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Piano roll">
+        <rect x="0" y="0" width={width} height={height} fill="#ffffff" />
+
+        {referenceNotes.map((note, idx) => {
+          const x = padX + (note.onset / maxTime) * drawW;
+          const w = Math.max(1.5, (note.duration / maxTime) * drawW);
+          const y = padY + ((maxPitch - note.pitch) / pitchSpan) * drawH;
+          const status = statusByRefIdx.get(idx) ?? "correct";
+          const color = status === "correct" ? "#cbd5e1" : STATUS_COLORS[status];
+          const opacity = status === "correct" ? 0.45 : 0.8;
+          return (
+            <rect
+              key={`ref-${idx}`}
+              x={x}
+              y={y}
+              width={w}
+              height={4}
+              fill={color}
+              opacity={opacity}
+            />
+          );
+        })}
+
+        {(playedNotes ?? []).map((note, idx) => {
+          const x = padX + (note.onset_ms / maxTime) * drawW;
+          const w = Math.max(1.5, (note.duration_ms / maxTime) * drawW);
+          const y = padY + ((maxPitch - note.pitch) / pitchSpan) * drawH;
+          return (
+            <rect
+              key={`played-${idx}`}
+              x={x}
+              y={y + 5}
+              width={w}
+              height={3}
+              fill="#111827"
+              opacity={0.55}
+            />
+          );
+        })}
+      </svg>
+      <p className="mt-2 text-sm text-zinc-600">
+        Legend: red = wrong pitch, gray = missed reference note, orange = extra played note.
+      </p>
+    </div>
   );
 }
