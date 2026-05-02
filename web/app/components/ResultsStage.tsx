@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef } from "react";
 import type {
   MidiResponse, VideoResponse, AlignResponse, PlayedNote,
   PoseResponse, TutorResponse, FocusArea, AnnotatedReferenceNote,
-  PostureFlag, PostureRule, LandmarkXY, PoseFrame, ReferenceNote,
+  PostureFlag, PostureRule, LandmarkXY, PoseFrame, ReferenceNote, TempoMapEntry,
 } from "./types";
 import {
   DYNAMIC_DELTA_ALERT_THRESHOLD, STATUS_COLORS, DYNAMIC_ALERT_COLOR,
@@ -33,6 +33,7 @@ type ResultsStageProps = {
   resolveApiUrl: (path: string) => string;
   postureWarning: string | null;
   tutorWarning: string | null;
+  onReset?: () => void;
 };
 
 export function ResultsStage({
@@ -107,6 +108,7 @@ export function ResultsStage({
               annotatedReferenceNotes={alignment.annotatedReferenceNotes}
               onColoringFailure={() => setRenderMode("piano-roll")}
               onNoteScrub={onSeekVideo}
+              videoRef={performanceVideoRef}
             />
           ) : (
             <PianoRollView
@@ -139,12 +141,18 @@ export function ResultsStage({
             ))}
           </div>
 
+          {/* Tempo map */}
+          {alignment.tempoMap && alignment.tempoMap.length >= 2 && (
+            <TempoMapView tempoMap={alignment.tempoMap} onSeekVideo={onSeekVideo} />
+          )}
+
           {/* Posture timeline */}
           {pose && (
             <PostureTimelineView
               totalDurationMs={analysisDurationMs}
               postureFlags={pose.postureFlags}
               sampleFps={pose.sampleFps}
+              onFlagClick={onSeekVideo}
             />
           )}
         </div>
@@ -503,14 +511,113 @@ function StatsStrip({
   );
 }
 
+// ===== TempoMapView =====
+
+function TempoMapView({
+  tempoMap, onSeekVideo,
+}: {
+  tempoMap: TempoMapEntry[];
+  onSeekVideo: (ms: number) => void;
+}) {
+  const svgW = 980, svgH = 80;
+  const padX = 36, padY = 12;
+  const drawW = svgW - padX * 2;
+  const drawH = svgH - padY * 2;
+  const maxDev = 30;
+
+  const zeroY = padY + drawH / 2;
+  const barW = Math.max(2, drawW / tempoMap.length - 1);
+
+  return (
+    <div className="sheet col" style={{ padding: "14px 18px 10px", gap: 6 }}>
+      <div className="row between center-y">
+        <span className="eyebrow">Tempo map</span>
+        <span className="serif-i" style={{ fontSize: 12, color: "var(--ink-mute)" }}>
+          bar-by-bar deviation from reference — click to jump
+        </span>
+      </div>
+      <svg
+        width="100%"
+        viewBox={`0 0 ${svgW} ${svgH}`}
+        role="img"
+        aria-label="Tempo map"
+        style={{ display: "block" }}
+      >
+        <rect x={0} y={0} width={svgW} height={svgH} fill="#faf5e8" />
+        {/* threshold lines at ±10% */}
+        {[-10, 10].map((pct) => {
+          const y = zeroY - (pct / maxDev) * (drawH / 2);
+          return (
+            <line
+              key={pct}
+              x1={padX} y1={y} x2={padX + drawW} y2={y}
+              stroke="var(--paper-edge)" strokeWidth={0.8} strokeDasharray="3 3"
+            />
+          );
+        })}
+        {/* zero line */}
+        <line x1={padX} y1={zeroY} x2={padX + drawW} y2={zeroY} stroke="var(--rule)" strokeWidth={1} />
+        {/* bars */}
+        {tempoMap.map((entry, idx) => {
+          const x = padX + (idx / tempoMap.length) * drawW;
+          const dev = entry.deviationPct;
+          if (dev === null) {
+            return (
+              <g key={idx} style={{ cursor: "pointer" }} onClick={() => onSeekVideo(entry.startMs)}>
+                <rect
+                  x={x} y={zeroY - 3} width={barW} height={6}
+                  fill="var(--paper-edge)" opacity={0.7}
+                />
+                <title>{`Measure ${entry.measureNumber}: insufficient data`}</title>
+              </g>
+            );
+          }
+          const clampedDev = Math.max(-maxDev, Math.min(maxDev, dev));
+          const barH = Math.abs(clampedDev / maxDev) * (drawH / 2);
+          const barY = dev >= 0 ? zeroY - barH : zeroY;
+          const neutral = Math.abs(dev) <= 5;
+          const color = neutral ? "var(--rule)" : dev > 0 ? "#c8853a" : "#4a7ab5";
+          const label = Math.abs(dev) <= 5 ? "on tempo" : dev > 0 ? "rushed" : "dragged";
+          return (
+            <g key={idx} style={{ cursor: "pointer" }} onClick={() => onSeekVideo(entry.startMs)}>
+              <rect
+                x={x} y={barY} width={barW} height={Math.max(2, barH)}
+                fill={color} opacity={0.85}
+                className="tempo-bar"
+              />
+              <title>{`Measure ${entry.measureNumber}: ${dev > 0 ? "+" : ""}${dev.toFixed(1)}% (${label})`}</title>
+            </g>
+          );
+        })}
+        {/* x-axis measure labels — every 4 measures */}
+        {tempoMap.filter((e) => e.measureNumber % 4 === 1).map((entry, idx) => {
+          const x = padX + ((entry.measureNumber - 1) / tempoMap.length) * drawW;
+          return (
+            <text
+              key={idx}
+              x={x} y={svgH - 1}
+              fontSize={9} fill="var(--ink-faint)"
+              fontFamily="var(--mono)"
+              textAnchor="middle"
+            >
+              {entry.measureNumber}
+            </text>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
 // ===== PostureTimelineView =====
 
 function PostureTimelineView({
-  totalDurationMs, postureFlags, sampleFps,
+  totalDurationMs, postureFlags, sampleFps, onFlagClick,
 }: {
   totalDurationMs: number;
   postureFlags: PostureFlag[];
   sampleFps: number;
+  onFlagClick?: (startMs: number) => void;
 }) {
   const lanes: PostureRule[] = ["slouched_back", "raised_shoulders", "collapsed_wrist", "flat_fingers"];
   return (
@@ -519,7 +626,7 @@ function PostureTimelineView({
         <div className="col" style={{ gap: 2 }}>
           <span className="eyebrow">Posture timeline</span>
           <span className="serif-i" style={{ fontSize: 13, color: "var(--ink-mute)" }}>
-            colored blocks are time-aligned posture flags from the video
+            colored blocks are time-aligned posture flags from the video — click to jump
           </span>
         </div>
         <span className="mono" style={{ fontSize: 11, color: "var(--ink-mute)" }}>
@@ -547,8 +654,13 @@ function PostureTimelineView({
                         width: `${widthPct}%`,
                         background: POSTURE_RULE_COLORS[lane],
                         opacity: postureSeverityOpacity(flag.severity),
+                        cursor: onFlagClick ? "pointer" : undefined,
+                        transition: "opacity .12s ease",
                       }}
-                      title={`${prettyRuleName(flag.type)} · ${flag.severity} · ${(flag.startMs / 1000).toFixed(1)}s – ${(flag.endMs / 1000).toFixed(1)}s`}
+                      title={`${prettyRuleName(flag.type)} · ${flag.severity} · ${(flag.startMs / 1000).toFixed(1)}s – ${(flag.endMs / 1000).toFixed(1)}s. Click to jump to this moment.`}
+                      onClick={onFlagClick ? () => onFlagClick(flag.startMs) : undefined}
+                      onMouseEnter={onFlagClick ? (e) => { (e.currentTarget as HTMLDivElement).style.opacity = "1"; } : undefined}
+                      onMouseLeave={onFlagClick ? (e) => { (e.currentTarget as HTMLDivElement).style.opacity = String(postureSeverityOpacity(flag.severity)); } : undefined}
                     />
                   );
                 })}
@@ -683,10 +795,17 @@ function applyAlignmentColors(osmd: OsmdLike, annotatedReferenceNotes: Annotated
   }
 }
 
-function bindScoreScrubClicks(osmd: OsmdLike, annotatedReferenceNotes: AnnotatedReferenceNote[], onNoteScrub: (ms: number) => void) {
+type NoteTimeEntry = { onset_ms: number; element: SVGGElement };
+
+function bindScoreScrubClicks(
+  osmd: OsmdLike,
+  annotatedReferenceNotes: AnnotatedReferenceNote[],
+  onNoteScrub: (ms: number) => void,
+): NoteTimeEntry[] {
   const sourceNotes = collectSourceNotes(osmd);
   const byRefIdx = new Map(annotatedReferenceNotes.map((n) => [n.refIdx, n]));
   let refIdx = 0;
+  const entries: NoteTimeEntry[] = [];
   for (const sn of sourceNotes) {
     if (typeof sn === "object" && sn && "isRest" in sn) {
       const rn = sn as { isRest?: () => boolean };
@@ -695,35 +814,43 @@ function bindScoreScrubClicks(osmd: OsmdLike, annotatedReferenceNotes: Annotated
     const annotated = byRefIdx.get(refIdx);
     if (!annotated) { refIdx++; continue; }
     const dynamicHint = dynamicTooltip(annotated);
-    const clickable = annotated.status !== "correct" || dynamicHint !== null;
-    if (!clickable) { refIdx++; continue; }
     const gn = osmd.EngravingRules?.GNote?.(sn);
     const group = gn?.getSVGGElement?.();
-    if (!group) { refIdx++; continue; }
-    group.style.cursor = "pointer";
-    group.setAttribute("tabindex", "0");
-    group.setAttribute("role", "button");
-    const baseText = `${(annotated.onset_ms / 1000).toFixed(2)}s`;
-    group.setAttribute("title", dynamicHint ? `${baseText} · ${dynamicHint}` : `${baseText} · ${annotated.status}`);
-    group.onclick = () => onNoteScrub(annotated.onset_ms);
-    group.onkeydown = (e: KeyboardEvent) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onNoteScrub(annotated.onset_ms); } };
+    if (group) {
+      group.style.cursor = "pointer";
+      group.setAttribute("tabindex", "0");
+      group.setAttribute("role", "button");
+      const baseText = `${(annotated.onset_ms / 1000).toFixed(2)}s`;
+      const statusHint = annotated.status !== "correct" ? ` · ${annotated.status}` : "";
+      group.setAttribute("title", dynamicHint ? `${baseText} · ${dynamicHint}` : `${baseText}${statusHint}`);
+      group.onclick = () => onNoteScrub(annotated.onset_ms);
+      group.onkeydown = (e: KeyboardEvent) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onNoteScrub(annotated.onset_ms); } };
+      entries.push({ onset_ms: annotated.onset_ms, element: group });
+    }
     refIdx++;
   }
+  return entries.sort((a, b) => a.onset_ms - b.onset_ms);
 }
 
 function ScoreView({
-  musicxml, annotatedReferenceNotes, onColoringFailure, onNoteScrub,
+  musicxml, annotatedReferenceNotes, onColoringFailure, onNoteScrub, videoRef,
 }: {
   musicxml: string;
   annotatedReferenceNotes: AnnotatedReferenceNote[];
   onColoringFailure: () => void;
   onNoteScrub: (ms: number) => void;
+  videoRef?: React.RefObject<HTMLVideoElement | null>;
 }) {
-  const ref = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const noteTimeMapRef = useRef<NoteTimeEntry[]>([]);
+  const cursorLineRef = useRef<SVGLineElement | null>(null);
+  const cursorSvgRef = useRef<SVGSVGElement | null>(null);
+
   useEffect(() => {
-    if (!ref.current) return;
-    const container = ref.current;
+    if (!containerRef.current) return;
+    const container = containerRef.current;
     let cancelled = false;
+    noteTimeMapRef.current = [];
     (async () => {
       const mod = await import("opensheetmusicdisplay");
       if (cancelled) return;
@@ -736,19 +863,89 @@ function ScoreView({
         inst.render();
         if (annotatedReferenceNotes?.length) {
           applyAlignmentColors(inst as unknown as OsmdLike, annotatedReferenceNotes, "post-render");
-          bindScoreScrubClicks(inst as unknown as OsmdLike, annotatedReferenceNotes, onNoteScrub);
+          noteTimeMapRef.current = bindScoreScrubClicks(inst as unknown as OsmdLike, annotatedReferenceNotes, onNoteScrub);
         }
       } catch (e) {
         container.innerHTML = `<p style="color:var(--vermilion)">Failed to render score: ${(e as Error).message}</p>`;
         onColoringFailure();
       }
     })();
-    return () => { cancelled = true; container.innerHTML = ""; };
+    return () => {
+      cancelled = true;
+      noteTimeMapRef.current = [];
+      cursorLineRef.current = null;
+      cursorSvgRef.current = null;
+      container.innerHTML = "";
+    };
   }, [musicxml, annotatedReferenceNotes, onColoringFailure, onNoteScrub]);
+
+  // Cursor tracking — listens to video timeupdate and moves a line in the OSMD SVG
+  useEffect(() => {
+    const video = videoRef?.current;
+    if (!video) return;
+
+    let rafId: number | null = null;
+
+    function moveCursor() {
+      const map = noteTimeMapRef.current;
+      if (!map.length) return;
+      const currentMs = video!.currentTime * 1000;
+
+      // Binary-search for last note whose onset <= currentMs
+      let lo = 0, hi = map.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (map[mid].onset_ms <= currentMs) lo = mid; else hi = mid - 1;
+      }
+      const noteEl = map[lo].element;
+      const ownerSvg = noteEl.ownerSVGElement;
+      if (!ownerSvg) return;
+
+      // Move cursor element to the correct SVG if the system changed
+      if (cursorSvgRef.current !== ownerSvg) {
+        if (cursorLineRef.current && cursorSvgRef.current) {
+          try { cursorSvgRef.current.removeChild(cursorLineRef.current); } catch { /* already removed */ }
+        }
+        if (!cursorLineRef.current) {
+          const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+          line.setAttribute("stroke", "rgba(192,52,29,0.65)");
+          line.setAttribute("stroke-width", "1.5");
+          line.style.pointerEvents = "none";
+          cursorLineRef.current = line;
+        }
+        ownerSvg.appendChild(cursorLineRef.current);
+        cursorSvgRef.current = ownerSvg;
+      }
+
+      const bbox = noteEl.getBBox();
+      const noteX = String(bbox.x + bbox.width / 2);
+      const svgH = String(ownerSvg.viewBox?.baseVal?.height || ownerSvg.clientHeight || 9999);
+      cursorLineRef.current!.setAttribute("x1", noteX);
+      cursorLineRef.current!.setAttribute("x2", noteX);
+      cursorLineRef.current!.setAttribute("y1", "0");
+      cursorLineRef.current!.setAttribute("y2", svgH);
+    }
+
+    function onTimeUpdate() {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(moveCursor);
+    }
+
+    video.addEventListener("timeupdate", onTimeUpdate);
+    return () => {
+      video.removeEventListener("timeupdate", onTimeUpdate);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      if (cursorLineRef.current && cursorSvgRef.current) {
+        try { cursorSvgRef.current.removeChild(cursorLineRef.current); } catch { /* already removed */ }
+        cursorLineRef.current = null;
+        cursorSvgRef.current = null;
+      }
+    };
+  }, [videoRef]);
 
   return (
     <div
-      ref={ref}
+      ref={containerRef}
       style={{
         overflowX: "auto",
         background: "#fefaf0",
@@ -814,6 +1011,7 @@ function PianoRollView({
               x={x} y={y} width={w} height={4}
               fill={color} opacity={opacity}
               onClick={clickable ? () => onNoteScrub(onsetMs) : undefined}
+              className={clickable ? "scrub-note" : undefined}
               style={clickable ? { cursor: "pointer" } : undefined}
             >
               <title>{dHint ?? `${(onsetMs / 1000).toFixed(2)}s · ${status}`}</title>

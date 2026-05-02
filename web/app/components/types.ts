@@ -89,10 +89,17 @@ export type AlignmentSummary = {
   tempoDeviationPct: number | null;
 };
 
+export type TempoMapEntry = {
+  measureNumber: number;
+  deviationPct: number | null;
+  startMs: number;
+};
+
 export type AlignResponse = {
   sessionId: string;
   annotatedReferenceNotes: AnnotatedReferenceNote[];
   summary: AlignmentSummary;
+  tempoMap: TempoMapEntry[] | null;
 };
 
 export type PostureFlag = {

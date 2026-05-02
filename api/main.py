@@ -1304,6 +1304,81 @@ def _synthesize_tutor_audio(script: str, *, sdir: Path) -> tuple[str, Path]:
     return voice_id, audio_path
 
 
+def _beats_per_measure(pm: pretty_midi.PrettyMIDI) -> int:
+    if pm.time_signature_changes:
+        return pm.time_signature_changes[0].numerator
+    return 4
+
+
+def _compute_tempo_map(
+    reference_notes: list[dict],
+    annotated_reference_notes: list[dict],
+    played_notes: list[dict],
+    beats_per_measure: int,
+    tempo_bpm: float,
+) -> list[dict]:
+    if not reference_notes or not played_notes or tempo_bpm <= 0:
+        return []
+
+    ms_per_beat = 60000.0 / tempo_bpm
+    ms_per_measure = ms_per_beat * beats_per_measure
+
+    # Build list of (ref_onset_ms, played_onset_ms) for all matched notes
+    matched_pairs: list[tuple[float, float]] = []
+    for ann in annotated_reference_notes:
+        if ann["playedIdx"] is not None:
+            ref_onset = float(ann["onset_ms"])
+            played_onset = float(played_notes[ann["playedIdx"]]["onset_ms"])
+            matched_pairs.append((ref_onset, played_onset))
+
+    if not matched_pairs:
+        return []
+
+    matched_pairs.sort(key=lambda p: p[0])
+    ref_start = reference_notes[0]["onset_ms"]
+    ref_end = reference_notes[-1]["onset_ms"]
+    n_measures = max(1, int((ref_end - ref_start) / ms_per_measure) + 1)
+
+    result = []
+    for measure_num in range(1, n_measures + 1):
+        measure_start_ms = ref_start + (measure_num - 1) * ms_per_measure
+        measure_end_ms = measure_start_ms + ms_per_measure
+
+        pairs_in_measure = [
+            (r, p) for r, p in matched_pairs
+            if measure_start_ms <= r < measure_end_ms
+        ]
+
+        deviation_pct: float | None = None
+        if len(pairs_in_measure) >= 2:
+            scales = []
+            for i in range(len(pairs_in_measure) - 1):
+                r0, p0 = pairs_in_measure[i]
+                r1, p1 = pairs_in_measure[i + 1]
+                ref_interval = r1 - r0
+                played_interval = p1 - p0
+                if ref_interval > 10:
+                    # scale > 1 means player took longer (dragging)
+                    # deviationPct: positive = rushed, negative = dragged
+                    scale = played_interval / ref_interval
+                    scales.append((1.0 - scale) * 100.0)
+            if scales:
+                scales.sort()
+                mid = len(scales) // 2
+                deviation_pct = (
+                    scales[mid] if len(scales) % 2
+                    else (scales[mid - 1] + scales[mid]) / 2.0
+                )
+
+        result.append({
+            "measureNumber": measure_num,
+            "deviationPct": deviation_pct,
+            "startMs": int(measure_start_ms),
+        })
+
+    return result
+
+
 def _dtw_align_notes(
     reference_notes: list[dict[str, int]],
     played_notes: list[dict[str, int]],
@@ -1807,6 +1882,21 @@ async def align(request: Request) -> dict:
 
     alignment, annotated_reference_notes, extra_played_notes, summary = _dtw_align_notes(reference_notes, played_notes)
 
+    # Compute per-measure tempo map
+    tempo_map: list[dict] = []
+    midi_path = sdir / "reference.mid"
+    if midi_path.exists():
+        try:
+            pm = pretty_midi.PrettyMIDI(str(midi_path))
+            beats_per_measure = _beats_per_measure(pm)
+            tempo_bpm = float(pm.estimate_tempo())
+            tempo_map = _compute_tempo_map(
+                reference_notes, annotated_reference_notes, played_notes,
+                beats_per_measure, tempo_bpm,
+            )
+        except Exception:
+            tempo_map = []
+
     alignment_path = sdir / "alignment.json"
     alignment_payload = {
         "sessionId": session_id,
@@ -1814,6 +1904,7 @@ async def align(request: Request) -> dict:
         "annotatedReferenceNotes": annotated_reference_notes,
         "extraPlayedNotes": extra_played_notes,
         "summary": summary,
+        "tempoMap": tempo_map,
     }
     alignment_path.write_text(
         json.dumps(alignment_payload, ensure_ascii=True, separators=(",", ":")),

@@ -261,6 +261,14 @@ h2.section {
 }
 .roll-note:hover { transform: translateY(-1px); filter: brightness(1.05); }
 
+/* Clickable SVG note rects in piano roll */
+.scrub-note { transition: filter .1s ease, opacity .1s ease; }
+.scrub-note:hover { filter: brightness(1.35) !important; opacity: 1 !important; }
+
+/* Tempo map bars */
+.tempo-bar { transition: filter .1s ease; }
+.tempo-bar:hover { filter: brightness(1.25); }
+
 /* ===== Animations ===== */
 @keyframes shimmer {
   0%   { background-position: -200% 0; }
