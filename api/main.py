@@ -50,6 +50,16 @@ LEGATO_OVERLAP_SEC = 0.018
 LEGATO_MAX_EXTENSION_SEC = 0.14
 FLUIDSYNTH_GAIN = 0.8
 DYNAMIC_DELTA_ALERT_THRESHOLD = 40
+PITCH_MATCH_TOLERANCE_SEMITONES = 1
+DTW_NEAR_PITCH_TOLERANCE_SEMITONES = 3
+TRANSCRIBE_ONSET_THRESHOLD = 0.45
+TRANSCRIBE_FRAME_THRESHOLD = 0.30
+TRANSCRIBE_MIN_NOTE_LENGTH_MS = 120
+TRANSCRIBE_MIN_MIDI_PITCH = 21
+TRANSCRIBE_MAX_MIDI_PITCH = 108
+TRANSCRIBE_MIN_NOTE_DURATION_MS = 70
+TRANSCRIBE_MERGE_GAP_MS = 35
+TRANSCRIBE_MERGE_WINDOW_MS = 140
 POSE_SAMPLE_FPS = 10
 POSTURE_MIN_SEGMENT_MS = 500
 POSTURE_GAP_TOLERANCE_MS = 220
@@ -148,6 +158,65 @@ def _played_notes_for_session(sdir: Path) -> list[dict[str, int]]:
         raise HTTPException(500, f"invalid played note payload: {e}")
 
     return sorted(notes, key=lambda x: (x["onset_ms"], x["pitch"]))
+
+
+def _pitch_distance_cost(ref_pitch: int, played_pitch: int) -> int:
+    delta = abs(int(ref_pitch) - int(played_pitch))
+    if delta <= PITCH_MATCH_TOLERANCE_SEMITONES:
+        return 0
+    if delta <= DTW_NEAR_PITCH_TOLERANCE_SEMITONES:
+        return 1
+    return 2 + min(12, delta - DTW_NEAR_PITCH_TOLERANCE_SEMITONES)
+
+
+def _smooth_transcribed_notes(notes: list[dict[str, int]]) -> list[dict[str, int]]:
+    if not notes:
+        return notes
+
+    prepared = sorted(
+        (
+            {
+                "pitch": int(note["pitch"]),
+                "onset_ms": int(note["onset_ms"]),
+                "duration_ms": max(1, int(note["duration_ms"])),
+                "velocity": int(note["velocity"]),
+            }
+            for note in notes
+            if TRANSCRIBE_MIN_MIDI_PITCH <= int(note["pitch"]) <= TRANSCRIBE_MAX_MIDI_PITCH
+            and int(note["duration_ms"]) >= TRANSCRIBE_MIN_NOTE_DURATION_MS
+        ),
+        key=lambda x: (x["onset_ms"], x["pitch"]),
+    )
+
+    if not prepared:
+        return []
+
+    merged: list[dict[str, int]] = []
+    for note in prepared:
+        if not merged:
+            merged.append(note)
+            continue
+
+        prev = merged[-1]
+        prev_end = prev["onset_ms"] + prev["duration_ms"]
+        note_end = note["onset_ms"] + note["duration_ms"]
+        onset_delta = note["onset_ms"] - prev["onset_ms"]
+        gap = note["onset_ms"] - prev_end
+        near_pitch = abs(note["pitch"] - prev["pitch"]) <= PITCH_MATCH_TOLERANCE_SEMITONES
+        same_note_cluster = near_pitch and onset_delta <= TRANSCRIBE_MERGE_WINDOW_MS and gap <= TRANSCRIBE_MERGE_GAP_MS
+
+        # Basic Pitch can split one keystroke into several tiny adjacent segments.
+        if same_note_cluster:
+            merged_end = max(prev_end, note_end)
+            prev["duration_ms"] = max(1, merged_end - prev["onset_ms"])
+            if note["velocity"] > prev["velocity"]:
+                prev["velocity"] = note["velocity"]
+                prev["pitch"] = note["pitch"]
+            continue
+
+        merged.append(note)
+
+    return merged
 
 
 def _timing_status(timing_delta_ms: int) -> str:
@@ -1024,7 +1093,7 @@ def _dtw_align_notes(
     _distance, raw_path = fastdtw(
         ref_pitches,
         played_pitches,
-        dist=lambda ref_pitch, played_pitch: 0 if ref_pitch == played_pitch else 1,
+        dist=_pitch_distance_cost,
     )
     if not raw_path:
         raise HTTPException(500, "alignment failed to produce a warp path")
@@ -1060,7 +1129,7 @@ def _dtw_align_notes(
                 timing_delta = (played_note["onset_ms"] - played_start) - (ref_note["onset_ms"] - ref_start)
                 timing_status = _timing_status(timing_delta)
                 dynamic_delta = int(played_note["velocity"]) - int(ref_note["velocity"])
-                status = "correct" if pitch_delta == 0 else "wrongPitch"
+                status = "correct" if abs(pitch_delta) <= PITCH_MATCH_TOLERANCE_SEMITONES else "wrongPitch"
                 if status == "correct":
                     correct_count += 1
                 else:
@@ -1361,12 +1430,12 @@ async def analyze(request: Request) -> dict:
         _model_output, midi_data, _note_events = bp_predict(
             str(audio_path),
             model_or_model_path=str(ICASSP_2022_MODEL_PATH.with_suffix(".onnx")),
-            onset_threshold=0.5,
-            frame_threshold=0.5,
-            minimum_note_length=100,
-            minimum_frequency=80.0,
-            maximum_frequency=2000.0,
-            melodia_trick=False,
+            onset_threshold=TRANSCRIBE_ONSET_THRESHOLD,
+            frame_threshold=TRANSCRIBE_FRAME_THRESHOLD,
+            minimum_note_length=TRANSCRIBE_MIN_NOTE_LENGTH_MS,
+            minimum_frequency=27.5,
+            maximum_frequency=4186.0,
+            melodia_trick=True,
             multiple_pitch_bends=False,
         )
     except Exception as e:
@@ -1386,6 +1455,7 @@ async def analyze(request: Request) -> dict:
         ],
         key=lambda x: (x["onset_ms"], x["pitch"]),
     )
+    played_notes = _smooth_transcribed_notes(played_notes)
 
     played_path = sdir / "played.json"
     played_path.write_text(
