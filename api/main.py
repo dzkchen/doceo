@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pretty_midi
 from basic_pitch.inference import ICASSP_2022_MODEL_PATH, predict as bp_predict
@@ -31,6 +32,290 @@ def _session_dir(session_id: str, *, create: bool = False) -> Path:
     elif not d.exists():
         raise HTTPException(404, f"unknown sessionId: {session_id}")
     return d
+
+
+async def _read_session_id(request: Request) -> str:
+    content_type = request.headers.get("content-type", "").lower()
+    raw_id: Any = None
+    if "application/json" in content_type:
+        body = await request.json()
+        if isinstance(body, dict):
+            raw_id = body.get("sessionId") or body.get("session_id")
+    else:
+        form = await request.form()
+        raw_id = form.get("sessionId") or form.get("session_id")
+
+    if isinstance(raw_id, str) and raw_id.strip():
+        return raw_id.strip()
+    raise HTTPException(400, "missing sessionId")
+
+
+def _normalize_note(note: dict[str, Any]) -> dict[str, int]:
+    onset = note.get("onset_ms", note.get("onset"))
+    duration = note.get("duration_ms", note.get("duration"))
+    if onset is None or duration is None:
+        raise ValueError("missing onset/duration in note")
+    return {
+        "pitch": int(note["pitch"]),
+        "onset_ms": int(onset),
+        "duration_ms": int(duration),
+        "velocity": int(note.get("velocity", 0)),
+    }
+
+
+def _reference_notes_for_session(sdir: Path) -> list[dict[str, int]]:
+    midi_path = sdir / "reference.mid"
+    if not midi_path.exists():
+        raise HTTPException(400, "missing reference MIDI for session; upload MIDI first")
+    try:
+        pm = pretty_midi.PrettyMIDI(str(midi_path))
+    except Exception as e:
+        raise HTTPException(500, f"failed to parse reference MIDI: {e}")
+
+    return sorted(
+        (
+            {
+                "pitch": int(n.pitch),
+                "onset_ms": int(n.start * 1000),
+                "duration_ms": int((n.end - n.start) * 1000),
+                "velocity": int(n.velocity),
+            }
+            for inst in pm.instruments
+            if not inst.is_drum
+            for n in inst.notes
+        ),
+        key=lambda x: (x["onset_ms"], x["pitch"]),
+    )
+
+
+def _played_notes_for_session(sdir: Path) -> list[dict[str, int]]:
+    played_path = sdir / "played.json"
+    if not played_path.exists():
+        raise HTTPException(400, "missing played notes for session; run /analyze first")
+    try:
+        raw = json.loads(played_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(500, f"failed to parse played.json: {e}")
+    raw_notes = raw.get("playedNotes")
+    if not isinstance(raw_notes, list):
+        raise HTTPException(500, "played.json missing playedNotes[]")
+
+    try:
+        notes = [_normalize_note(n) for n in raw_notes]
+    except Exception as e:
+        raise HTTPException(500, f"invalid played note payload: {e}")
+
+    return sorted(notes, key=lambda x: (x["onset_ms"], x["pitch"]))
+
+
+def _note_match_cost(ref_note: dict[str, int], played_note: dict[str, int]) -> float:
+    pitch_diff = abs(ref_note["pitch"] - played_note["pitch"])
+    ref_onset = int(ref_note.get("rel_onset_ms", ref_note["onset_ms"]))
+    played_onset = int(played_note.get("rel_onset_ms", played_note["onset_ms"]))
+    onset_diff = abs(ref_onset - played_onset)
+    duration_diff = abs(ref_note["duration_ms"] - played_note["duration_ms"])
+
+    pitch_cost = min(pitch_diff, 24) * 4.5
+    onset_cost = min(onset_diff / 120.0, 14.0)
+    duration_cost = min(duration_diff / 250.0, 4.0)
+    if onset_diff > 2500:
+        onset_cost += 10.0
+    return pitch_cost + onset_cost + duration_cost
+
+
+def _dtw_align_notes(
+    reference_notes: list[dict[str, int]],
+    played_notes: list[dict[str, int]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    if played_notes:
+        played_end = max(n["onset_ms"] + n["duration_ms"] for n in played_notes)
+        clip_end = played_end + 1200
+        clipped_reference = [n for n in reference_notes if n["onset_ms"] <= clip_end]
+        if clipped_reference:
+            reference_notes = clipped_reference
+
+    n = len(reference_notes)
+    m = len(played_notes)
+    if n == 0:
+        raise HTTPException(400, "reference note list is empty")
+
+    ref_start = reference_notes[0]["onset_ms"]
+    played_start = played_notes[0]["onset_ms"] if played_notes else 0
+    ref_seq = [{**n, "rel_onset_ms": n["onset_ms"] - ref_start} for n in reference_notes]
+    played_seq = [{**n, "rel_onset_ms": n["onset_ms"] - played_start} for n in played_notes]
+
+    gap_cost = 9.0
+    inf = float("inf")
+
+    dp = [[inf] * (m + 1) for _ in range(n + 1)]
+    back: list[list[str | None]] = [[None] * (m + 1) for _ in range(n + 1)]
+    dp[0][0] = 0.0
+
+    for i in range(1, n + 1):
+        dp[i][0] = dp[i - 1][0] + gap_cost
+        back[i][0] = "up"
+    for j in range(1, m + 1):
+        dp[0][j] = dp[0][j - 1] + gap_cost
+        back[0][j] = "left"
+
+    band = max(24, abs(n - m) + 24)
+    for i in range(1, n + 1):
+        j_min = max(1, i - band)
+        j_max = min(m, i + band)
+        for j in range(j_min, j_max + 1):
+            diag = dp[i - 1][j - 1] + _note_match_cost(ref_seq[i - 1], played_seq[j - 1])
+            up = dp[i - 1][j] + gap_cost
+            left = dp[i][j - 1] + gap_cost
+
+            best = diag
+            move = "diag"
+            if up < best:
+                best = up
+                move = "up"
+            if left < best:
+                best = left
+                move = "left"
+            dp[i][j] = best
+            back[i][j] = move
+
+    if back[n][m] is None and (n > 0 or m > 0):
+        raise HTTPException(500, "alignment failed to find a valid path")
+
+    alignment: list[dict[str, Any]] = []
+    ref_annotations: list[dict[str, Any]] = []
+    extra_count = 0
+    missed_count = 0
+    wrong_pitch_count = 0
+    correct_count = 0
+
+    i = n
+    j = m
+    while i > 0 or j > 0:
+        move = back[i][j]
+        if move == "diag":
+            ref_idx = i - 1
+            played_idx = j - 1
+            ref_note = reference_notes[ref_idx]
+            played_note = played_notes[played_idx]
+            pitch_delta = played_note["pitch"] - ref_note["pitch"]
+            timing_delta = (played_note["onset_ms"] - played_start) - (ref_note["onset_ms"] - ref_start)
+            status = "correct" if pitch_delta == 0 else "wrong-pitch"
+            if status == "correct":
+                correct_count += 1
+            else:
+                wrong_pitch_count += 1
+            alignment.append(
+                {
+                    "refIdx": ref_idx,
+                    "playedIdx": played_idx,
+                    "status": status,
+                    "timingDeltaMs": timing_delta,
+                    "pitchDelta": pitch_delta,
+                }
+            )
+            ref_annotations.append(
+                {
+                    "refIdx": ref_idx,
+                    "playedIdx": played_idx,
+                    "status": status,
+                    "timingDeltaMs": timing_delta,
+                    "pitchDelta": pitch_delta,
+                }
+            )
+            i -= 1
+            j -= 1
+            continue
+
+        if move == "up":
+            ref_idx = i - 1
+            missed_count += 1
+            alignment.append(
+                {
+                    "refIdx": ref_idx,
+                    "playedIdx": None,
+                    "status": "missed",
+                    "timingDeltaMs": None,
+                    "pitchDelta": None,
+                }
+            )
+            ref_annotations.append(
+                {
+                    "refIdx": ref_idx,
+                    "playedIdx": None,
+                    "status": "missed",
+                    "timingDeltaMs": None,
+                    "pitchDelta": None,
+                }
+            )
+            i -= 1
+            continue
+
+        if move == "left":
+            played_idx = j - 1
+            extra_count += 1
+            alignment.append(
+                {
+                    "refIdx": None,
+                    "playedIdx": played_idx,
+                    "status": "extra",
+                    "timingDeltaMs": None,
+                    "pitchDelta": None,
+                }
+            )
+            j -= 1
+            continue
+
+        raise HTTPException(500, "alignment traceback failed")
+
+    alignment.reverse()
+    ref_annotations.reverse()
+
+    extra_played_notes = []
+    for row in alignment:
+        if row["status"] != "extra":
+            continue
+        played_idx = row["playedIdx"]
+        if played_idx is None:
+            continue
+        note = played_notes[played_idx]
+        extra_played_notes.append(
+            {
+                "playedIdx": played_idx,
+                "pitch": note["pitch"],
+                "onset_ms": note["onset_ms"],
+                "duration_ms": note["duration_ms"],
+                "velocity": note["velocity"],
+                "status": "extra",
+            }
+        )
+
+    annotated_reference_notes = []
+    for idx, ref_note in enumerate(reference_notes):
+        ann = ref_annotations[idx]
+        annotated_reference_notes.append(
+            {
+                "refIdx": idx,
+                "pitch": ref_note["pitch"],
+                "onset_ms": ref_note["onset_ms"],
+                "duration_ms": ref_note["duration_ms"],
+                "velocity": ref_note["velocity"],
+                "status": ann["status"],
+                "playedIdx": ann["playedIdx"],
+                "timingDeltaMs": ann["timingDeltaMs"],
+                "pitchDelta": ann["pitchDelta"],
+            }
+        )
+
+    summary = {
+        "correct": correct_count,
+        "wrongPitch": wrong_pitch_count,
+        "missed": missed_count,
+        "extra": extra_count,
+        "matched": correct_count + wrong_pitch_count,
+        "referenceCount": n,
+        "playedCount": m,
+    }
+    return alignment, annotated_reference_notes, extra_played_notes, summary
 
 
 @app.get("/health")
@@ -138,23 +423,7 @@ async def upload_video(
 
 @app.post("/analyze")
 async def analyze(request: Request) -> dict:
-    session_id: str | None = None
-    content_type = request.headers.get("content-type", "").lower()
-    if "application/json" in content_type:
-        body = await request.json()
-        if isinstance(body, dict):
-            raw_id = body.get("sessionId") or body.get("session_id")
-            if isinstance(raw_id, str):
-                session_id = raw_id
-    else:
-        form = await request.form()
-        raw_id = form.get("sessionId") or form.get("session_id")
-        if isinstance(raw_id, str):
-            session_id = raw_id
-
-    if not session_id:
-        raise HTTPException(400, "missing sessionId")
-
+    session_id = await _read_session_id(request)
     sdir = _session_dir(session_id)
     audio_path = sdir / "performance.wav"
     if not audio_path.exists():
@@ -214,4 +483,33 @@ async def analyze(request: Request) -> dict:
         "playedPath": str(played_path.relative_to(STORAGE.parent)),
         "transcribedMidiPath": str(transcription_path.relative_to(STORAGE.parent)),
         "durationMs": int(midi_data.get_end_time() * 1000),
+    }
+
+
+@app.post("/align")
+async def align(request: Request) -> dict:
+    session_id = await _read_session_id(request)
+    sdir = _session_dir(session_id)
+
+    reference_notes = _reference_notes_for_session(sdir)
+    played_notes = _played_notes_for_session(sdir)
+
+    alignment, annotated_reference_notes, extra_played_notes, summary = _dtw_align_notes(reference_notes, played_notes)
+
+    alignment_path = sdir / "alignment.json"
+    alignment_payload = {
+        "sessionId": session_id,
+        "alignment": alignment,
+        "annotatedReferenceNotes": annotated_reference_notes,
+        "extraPlayedNotes": extra_played_notes,
+        "summary": summary,
+    }
+    alignment_path.write_text(
+        json.dumps(alignment_payload, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    return {
+        **alignment_payload,
+        "alignmentPath": str(alignment_path.relative_to(STORAGE.parent)),
     }
