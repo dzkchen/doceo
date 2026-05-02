@@ -2,5 +2,8 @@
 .venv/
 api/.venv/
 tests/
+!tests/
+tests/*
+!tests/test_transcription_cleanup.py
 api/assets/*.sf2
 api/assets/*.sf3

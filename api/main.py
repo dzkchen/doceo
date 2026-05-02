@@ -52,14 +52,25 @@ FLUIDSYNTH_GAIN = 0.8
 DYNAMIC_DELTA_ALERT_THRESHOLD = 40
 PITCH_MATCH_TOLERANCE_SEMITONES = 1
 DTW_NEAR_PITCH_TOLERANCE_SEMITONES = 3
-TRANSCRIBE_ONSET_THRESHOLD = 0.45
-TRANSCRIBE_FRAME_THRESHOLD = 0.30
-TRANSCRIBE_MIN_NOTE_LENGTH_MS = 120
+DTW_TIMING_BUCKET_MS = 90
+DTW_TIMING_COST_CAP = 5
+TRANSCRIBE_ONSET_THRESHOLD = 0.40
+TRANSCRIBE_FRAME_THRESHOLD = 0.28
+TRANSCRIBE_MIN_NOTE_LENGTH_MS = 80
 TRANSCRIBE_MIN_MIDI_PITCH = 21
 TRANSCRIBE_MAX_MIDI_PITCH = 108
-TRANSCRIBE_MIN_NOTE_DURATION_MS = 70
-TRANSCRIBE_MERGE_GAP_MS = 35
-TRANSCRIBE_MERGE_WINDOW_MS = 140
+TRANSCRIBE_MIN_NOTE_DURATION_MS = 45
+TRANSCRIBE_MERGE_GAP_MS = 70
+TRANSCRIBE_MERGE_WINDOW_MS = 180
+TRANSCRIBE_DUPLICATE_ONSET_WINDOW_MS = 45
+TRANSCRIBE_REFERENCE_GUIDE_WINDOW_MS = 420
+TRANSCRIBE_REFERENCE_WRONG_PITCH_WINDOW_MS = 250
+TRANSCRIBE_REFERENCE_MAX_TEMPO_SCALE_DEVIATION = 0.25
+TRANSCRIBE_EXTRA_DUPLICATE_WINDOW_MS = 120
+AUDIO_ALIGN_HOP_MS = 20
+AUDIO_ALIGN_WINDOW_MS = 60
+AUDIO_ALIGN_MAX_OFFSET_MS = 1500
+AUDIO_ALIGN_MAX_SECONDS = 45
 POSE_SAMPLE_FPS = 10
 POSTURE_MIN_SEGMENT_MS = 500
 POSTURE_GAP_TOLERANCE_MS = 220
@@ -169,6 +180,19 @@ def _pitch_distance_cost(ref_pitch: int, played_pitch: int) -> int:
     return 2 + min(12, delta - DTW_NEAR_PITCH_TOLERANCE_SEMITONES)
 
 
+def _merge_transcribed_note(target: dict[str, int], incoming: dict[str, int]) -> None:
+    start = min(target["onset_ms"], incoming["onset_ms"])
+    end = max(
+        target["onset_ms"] + target["duration_ms"],
+        incoming["onset_ms"] + incoming["duration_ms"],
+    )
+    target["onset_ms"] = start
+    target["duration_ms"] = max(1, end - start)
+    if incoming["velocity"] > target["velocity"]:
+        target["velocity"] = incoming["velocity"]
+        target["pitch"] = incoming["pitch"]
+
+
 def _smooth_transcribed_notes(notes: list[dict[str, int]]) -> list[dict[str, int]]:
     if not notes:
         return notes
@@ -193,30 +217,193 @@ def _smooth_transcribed_notes(notes: list[dict[str, int]]) -> list[dict[str, int
 
     merged: list[dict[str, int]] = []
     for note in prepared:
-        if not merged:
-            merged.append(note)
-            continue
+        best_idx: int | None = None
+        best_score: tuple[int, int] | None = None
 
-        prev = merged[-1]
-        prev_end = prev["onset_ms"] + prev["duration_ms"]
-        note_end = note["onset_ms"] + note["duration_ms"]
-        onset_delta = note["onset_ms"] - prev["onset_ms"]
-        gap = note["onset_ms"] - prev_end
-        near_pitch = abs(note["pitch"] - prev["pitch"]) <= PITCH_MATCH_TOLERANCE_SEMITONES
-        same_note_cluster = near_pitch and onset_delta <= TRANSCRIBE_MERGE_WINDOW_MS and gap <= TRANSCRIBE_MERGE_GAP_MS
+        for idx in range(len(merged) - 1, -1, -1):
+            candidate = merged[idx]
+            onset_delta = abs(note["onset_ms"] - candidate["onset_ms"])
+            if note["onset_ms"] - candidate["onset_ms"] > TRANSCRIBE_MERGE_WINDOW_MS:
+                break
 
-        # Basic Pitch can split one keystroke into several tiny adjacent segments.
-        if same_note_cluster:
-            merged_end = max(prev_end, note_end)
-            prev["duration_ms"] = max(1, merged_end - prev["onset_ms"])
-            if note["velocity"] > prev["velocity"]:
-                prev["velocity"] = note["velocity"]
-                prev["pitch"] = note["pitch"]
+            pitch_delta = abs(note["pitch"] - candidate["pitch"])
+            if pitch_delta > PITCH_MATCH_TOLERANCE_SEMITONES:
+                continue
+
+            candidate_end = candidate["onset_ms"] + candidate["duration_ms"]
+            note_end = note["onset_ms"] + note["duration_ms"]
+            overlap = min(candidate_end, note_end) - max(candidate["onset_ms"], note["onset_ms"])
+            gap = max(0, note["onset_ms"] - candidate_end, candidate["onset_ms"] - note_end)
+            same_split_note = gap <= TRANSCRIBE_MERGE_GAP_MS and onset_delta <= TRANSCRIBE_MERGE_WINDOW_MS
+            duplicate_detection = onset_delta <= TRANSCRIBE_DUPLICATE_ONSET_WINDOW_MS and overlap >= 0
+            if not same_split_note and not duplicate_detection:
+                continue
+
+            score = (pitch_delta, onset_delta)
+            if best_score is None or score < best_score:
+                best_idx = idx
+                best_score = score
+
+        if best_idx is not None:
+            _merge_transcribed_note(merged[best_idx], note)
             continue
 
         merged.append(note)
 
-    return merged
+    return sorted(merged, key=lambda x: (x["onset_ms"], x["pitch"]))
+
+
+def _notes_to_pretty_midi(notes: list[dict[str, int]]) -> pretty_midi.PrettyMIDI:
+    pm = pretty_midi.PrettyMIDI()
+    piano = pretty_midi.Instrument(program=pretty_midi.instrument_name_to_program("Acoustic Grand Piano"))
+    for note in sorted(notes, key=lambda x: (x["onset_ms"], x["pitch"])):
+        start = max(0.0, note["onset_ms"] / 1000.0)
+        end = max(start + 0.001, (note["onset_ms"] + note["duration_ms"]) / 1000.0)
+        piano.notes.append(
+            pretty_midi.Note(
+                velocity=max(1, min(127, int(note["velocity"]))),
+                pitch=max(0, min(127, int(note["pitch"]))),
+                start=start,
+                end=end,
+            )
+        )
+    pm.instruments.append(piano)
+    return pm
+
+
+def _alignment_event_distance(ref_event: Any, played_event: Any) -> int:
+    pitch_cost = _pitch_distance_cost(int(ref_event[0]), int(played_event[0])) * 6
+    timing_delta = abs(int(ref_event[1]) - int(played_event[1]))
+    timing_cost = min(DTW_TIMING_COST_CAP, int(round(timing_delta / DTW_TIMING_BUCKET_MS)))
+    return pitch_cost + timing_cost
+
+
+def _fit_reference_timing_map(
+    reference_notes: list[dict[str, int]],
+    played_notes: list[dict[str, int]],
+    *,
+    offset_ms: int,
+) -> tuple[float, float]:
+    if not reference_notes or not played_notes:
+        return 1.0, float(offset_ms)
+
+    pairs: list[tuple[int, int]] = []
+    used: set[int] = set()
+    for ref_note in reference_notes:
+        expected = ref_note["onset_ms"] + offset_ms
+        best_idx: int | None = None
+        best_score: int | None = None
+        for idx, played_note in enumerate(played_notes):
+            if idx in used:
+                continue
+            pitch_delta = abs(played_note["pitch"] - ref_note["pitch"])
+            if pitch_delta > PITCH_MATCH_TOLERANCE_SEMITONES:
+                continue
+            timing_delta = abs(played_note["onset_ms"] - expected)
+            if timing_delta > TRANSCRIBE_REFERENCE_GUIDE_WINDOW_MS:
+                continue
+            score = timing_delta + pitch_delta * 80
+            if best_score is None or score < best_score:
+                best_idx = idx
+                best_score = score
+        if best_idx is None:
+            continue
+        used.add(best_idx)
+        pairs.append((ref_note["onset_ms"], played_notes[best_idx]["onset_ms"]))
+
+    if len(pairs) < 4:
+        return 1.0, float(offset_ms)
+
+    ref_onsets = np.asarray([p[0] for p in pairs], dtype=np.float64)
+    played_onsets = np.asarray([p[1] for p in pairs], dtype=np.float64)
+    try:
+        scale, intercept = np.polyfit(ref_onsets, played_onsets, 1)
+    except Exception:
+        return 1.0, float(offset_ms)
+
+    min_scale = 1.0 - TRANSCRIBE_REFERENCE_MAX_TEMPO_SCALE_DEVIATION
+    max_scale = 1.0 + TRANSCRIBE_REFERENCE_MAX_TEMPO_SCALE_DEVIATION
+    if not math.isfinite(scale) or not math.isfinite(intercept) or scale < min_scale or scale > max_scale:
+        return 1.0, float(offset_ms)
+    return float(scale), float(intercept)
+
+
+def _reference_guided_transcribed_notes(
+    played_notes: list[dict[str, int]],
+    reference_notes: list[dict[str, int]],
+    *,
+    offset_ms: int = 0,
+) -> list[dict[str, int]]:
+    if not played_notes or not reference_notes:
+        return played_notes
+
+    scale, intercept = _fit_reference_timing_map(reference_notes, played_notes, offset_ms=offset_ms)
+    selected: set[int] = set()
+
+    def expected_onset(ref_note: dict[str, int]) -> float:
+        return scale * float(ref_note["onset_ms"]) + intercept
+
+    for ref_note in reference_notes:
+        expected = expected_onset(ref_note)
+        best_idx: int | None = None
+        best_score: float | None = None
+
+        for idx, played_note in enumerate(played_notes):
+            if idx in selected:
+                continue
+            timing_delta = abs(float(played_note["onset_ms"]) - expected)
+            pitch_delta = abs(int(played_note["pitch"]) - int(ref_note["pitch"]))
+            if pitch_delta <= PITCH_MATCH_TOLERANCE_SEMITONES:
+                window = TRANSCRIBE_REFERENCE_GUIDE_WINDOW_MS
+            elif pitch_delta <= DTW_NEAR_PITCH_TOLERANCE_SEMITONES:
+                window = TRANSCRIBE_REFERENCE_GUIDE_WINDOW_MS
+            else:
+                window = TRANSCRIBE_REFERENCE_WRONG_PITCH_WINDOW_MS
+            if timing_delta > window:
+                continue
+
+            duration_penalty = max(0, 95 - int(played_note["duration_ms"])) * 0.35
+            score = timing_delta + _pitch_distance_cost(ref_note["pitch"], played_note["pitch"]) * 130 + duration_penalty
+            score -= min(127, max(0, int(played_note["velocity"]))) * 0.18
+            if best_score is None or score < best_score:
+                best_idx = idx
+                best_score = score
+
+        if best_idx is not None:
+            selected.add(best_idx)
+
+    if not selected:
+        return played_notes
+
+    reference_last = max(n["onset_ms"] + n["duration_ms"] for n in reference_notes)
+    for idx, played_note in enumerate(played_notes):
+        if idx in selected:
+            continue
+        if played_note["onset_ms"] > scale * reference_last + intercept + 1200:
+            continue
+
+        duplicate = False
+        for selected_idx in selected:
+            selected_note = played_notes[selected_idx]
+            if abs(played_note["pitch"] - selected_note["pitch"]) > PITCH_MATCH_TOLERANCE_SEMITONES:
+                continue
+            if abs(played_note["onset_ms"] - selected_note["onset_ms"]) <= TRANSCRIBE_EXTRA_DUPLICATE_WINDOW_MS:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+
+        near_reference_time = any(
+            abs(float(played_note["onset_ms"]) - expected_onset(ref_note)) <= TRANSCRIBE_REFERENCE_GUIDE_WINDOW_MS
+            for ref_note in reference_notes
+        )
+        if near_reference_time:
+            continue
+        if played_note["duration_ms"] < 90:
+            continue
+        selected.add(idx)
+
+    return sorted((played_notes[idx] for idx in selected), key=lambda x: (x["onset_ms"], x["pitch"]))
 
 
 def _timing_status(timing_delta_ms: int) -> str:
@@ -380,6 +567,101 @@ def _one_pole_lowpass(signal: np.ndarray, *, sample_rate: int, cutoff_hz: float)
     for idx in range(1, signal.shape[0]):
         output[idx] = coeff * float(signal[idx]) + alpha * output[idx - 1]
     return output
+
+
+def _read_wav_mono(path: Path) -> tuple[np.ndarray, int]:
+    with wave.open(str(path), "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        sample_rate = wav_file.getframerate()
+        frames = wav_file.readframes(wav_file.getnframes())
+
+    if sample_width == 1:
+        audio = (np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    elif sample_width == 2:
+        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sample_width == 4:
+        audio = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(f"unsupported WAV sample width: {sample_width}")
+
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+    return np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0), sample_rate
+
+
+def _resample_linear(audio: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    if source_rate == target_rate or audio.size == 0:
+        return audio.astype(np.float32, copy=False)
+    duration = audio.size / float(source_rate)
+    target_size = max(1, int(round(duration * target_rate)))
+    source_x = np.linspace(0.0, duration, num=audio.size, endpoint=False)
+    target_x = np.linspace(0.0, duration, num=target_size, endpoint=False)
+    return np.interp(target_x, source_x, audio).astype(np.float32)
+
+
+def _audio_onset_envelope(audio: np.ndarray, sample_rate: int) -> np.ndarray:
+    if audio.size == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    max_samples = int(AUDIO_ALIGN_MAX_SECONDS * sample_rate)
+    if audio.size > max_samples:
+        audio = audio[:max_samples]
+
+    hop = max(1, int(round(sample_rate * AUDIO_ALIGN_HOP_MS / 1000.0)))
+    window = max(hop, int(round(sample_rate * AUDIO_ALIGN_WINDOW_MS / 1000.0)))
+    if audio.size < window:
+        return np.zeros(0, dtype=np.float32)
+
+    energy = []
+    for start in range(0, audio.size - window + 1, hop):
+        frame = audio[start : start + window]
+        energy.append(float(np.sqrt(np.mean(frame * frame))))
+    envelope = np.asarray(energy, dtype=np.float32)
+    if envelope.size <= 1:
+        return envelope
+
+    envelope = np.maximum(0.0, np.diff(envelope, prepend=envelope[0]))
+    envelope -= float(np.mean(envelope))
+    std = float(np.std(envelope))
+    if std > 1e-8:
+        envelope /= std
+    return envelope
+
+
+def _estimate_reference_audio_offset_ms(performance_audio_path: Path, reference_audio_path: Path) -> int | None:
+    try:
+        performance_audio, performance_rate = _read_wav_mono(performance_audio_path)
+        reference_audio, reference_rate = _read_wav_mono(reference_audio_path)
+    except Exception as exc:
+        print(f"[audio-align] skipped reference audio alignment: {exc}")
+        return None
+
+    performance_audio = _resample_linear(performance_audio, performance_rate, REFERENCE_SYNTH_SAMPLE_RATE)
+    reference_audio = _resample_linear(reference_audio, reference_rate, REFERENCE_SYNTH_SAMPLE_RATE)
+    performance_env = _audio_onset_envelope(performance_audio, REFERENCE_SYNTH_SAMPLE_RATE)
+    reference_env = _audio_onset_envelope(reference_audio, REFERENCE_SYNTH_SAMPLE_RATE)
+    if performance_env.size < 10 or reference_env.size < 10:
+        return None
+
+    max_lag = max(1, int(round(AUDIO_ALIGN_MAX_OFFSET_MS / AUDIO_ALIGN_HOP_MS)))
+    best_lag = 0
+    best_score: float | None = None
+    for lag in range(-max_lag, max_lag + 1):
+        if lag >= 0:
+            ref_segment = reference_env[: min(reference_env.size, performance_env.size - lag)]
+            perf_segment = performance_env[lag : lag + ref_segment.size]
+        else:
+            perf_segment = performance_env[: min(performance_env.size, reference_env.size + lag)]
+            ref_segment = reference_env[-lag : -lag + perf_segment.size]
+        if ref_segment.size < 10 or perf_segment.size < 10:
+            continue
+        score = float(np.dot(ref_segment, perf_segment) / ref_segment.size)
+        if best_score is None or score > best_score:
+            best_lag = lag
+            best_score = score
+
+    return int(best_lag * AUDIO_ALIGN_HOP_MS)
 
 
 def _synthesize_reference_audio(
@@ -1087,13 +1369,19 @@ def _dtw_align_notes(
 
     ref_start = reference_notes[0]["onset_ms"]
     played_start = played_notes[0]["onset_ms"]
-    ref_pitches = [note["pitch"] for note in reference_notes]
-    played_pitches = [note["pitch"] for note in played_notes]
+    ref_events = [
+        (note["pitch"], note["onset_ms"] - ref_start)
+        for note in reference_notes
+    ]
+    played_events = [
+        (note["pitch"], note["onset_ms"] - played_start)
+        for note in played_notes
+    ]
 
     _distance, raw_path = fastdtw(
-        ref_pitches,
-        played_pitches,
-        dist=_pitch_distance_cost,
+        ref_events,
+        played_events,
+        dist=_alignment_event_distance,
     )
     if not raw_path:
         raise HTTPException(500, "alignment failed to produce a warp path")
@@ -1457,6 +1745,25 @@ async def analyze(request: Request) -> dict:
     )
     played_notes = _smooth_transcribed_notes(played_notes)
 
+    audio_reference_offset_ms: int | None = None
+    try:
+        reference_notes = _reference_notes_for_session(sdir)
+        reference_audio_path = sdir / "reference_synth.wav"
+        if not reference_audio_path.exists():
+            reference_pm = pretty_midi.PrettyMIDI(str(sdir / "reference.mid"))
+            reference_audio_path, _reference_audio_renderer = _synthesize_reference_audio(reference_pm, sdir=sdir)
+        if reference_audio_path is not None and reference_audio_path.exists():
+            audio_reference_offset_ms = _estimate_reference_audio_offset_ms(audio_path, reference_audio_path)
+        played_notes = _reference_guided_transcribed_notes(
+            played_notes,
+            reference_notes,
+            offset_ms=audio_reference_offset_ms or 0,
+        )
+    except Exception as exc:
+        print(f"[analyze] reference-guided transcription cleanup skipped: {exc}")
+
+    cleaned_midi = _notes_to_pretty_midi(played_notes)
+
     played_path = sdir / "played.json"
     played_path.write_text(
         json.dumps(
@@ -1464,6 +1771,7 @@ async def analyze(request: Request) -> dict:
                 "sessionId": session_id,
                 "playedNotes": played_notes,
                 "noteCount": len(played_notes),
+                "audioReferenceOffsetMs": audio_reference_offset_ms,
             },
             ensure_ascii=True,
             separators=(",", ":"),
@@ -1471,8 +1779,11 @@ async def analyze(request: Request) -> dict:
         encoding="utf-8",
     )
 
+    raw_transcription_path = sdir / "performance.raw.transcribed.mid"
+    midi_data.write(str(raw_transcription_path))
+
     transcription_path = sdir / "performance.transcribed.mid"
-    midi_data.write(str(transcription_path))
+    cleaned_midi.write(str(transcription_path))
 
     return {
         "sessionId": session_id,
@@ -1480,7 +1791,9 @@ async def analyze(request: Request) -> dict:
         "noteCount": len(played_notes),
         "playedPath": str(played_path.relative_to(STORAGE.parent)),
         "transcribedMidiPath": str(transcription_path.relative_to(STORAGE.parent)),
-        "durationMs": int(midi_data.get_end_time() * 1000),
+        "rawTranscribedMidiPath": str(raw_transcription_path.relative_to(STORAGE.parent)),
+        "durationMs": int(cleaned_midi.get_end_time() * 1000),
+        "audioReferenceOffsetMs": audio_reference_offset_ms,
     }
 
 
