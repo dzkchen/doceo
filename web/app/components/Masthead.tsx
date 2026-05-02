@@ -65,12 +65,6 @@ export function Masthead({ sessionId, stage, onReset }: MastheadProps) {
         </div>
       </div>
       <div className="double-rule" />
-      <div className="row between" style={{ marginTop: -2 }}>
-        <span className="serif-i" style={{ fontSize: 14, color: "var(--ink-mute)" }}>
-          A patient ear for solitary practice — Vol. I, No. 47
-        </span>
-        <span className="eyebrow">The Practice Journal</span>
-      </div>
     </header>
   );
 }

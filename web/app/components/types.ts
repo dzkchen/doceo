@@ -1,5 +1,3 @@
-// Shared types and constants used across all stage components
-
 export const DYNAMIC_DELTA_ALERT_THRESHOLD = 40;
 
 export const STATUS_COLORS: Record<"wrongPitch" | "missed" | "extra", string> = {
@@ -35,6 +33,7 @@ export type MidiResponse = {
   referenceNotes: ReferenceNote[];
   musicxml: string | null;
   tempoBpm: number | null;
+  isPianoOnly: boolean;
   durationMs: number;
   noteCount: number;
   referenceAudioPath: string | null;
@@ -59,6 +58,13 @@ export type PlayedNote = {
   velocity: number;
 };
 
+export type DynamicInfo = {
+  refDynamic: string;
+  playedDynamic: string;
+  direction: "too loud" | "too soft";
+  steps: number;
+};
+
 export type AnnotatedReferenceNote = {
   refIdx: number;
   pitch: number;
@@ -72,6 +78,7 @@ export type AnnotatedReferenceNote = {
   pitchDelta: number | null;
   dynamicDelta: number | null;
   dynamicLabel: string | null;
+  dynamicInfo: DynamicInfo | null;
 };
 
 export type AlignmentSummary = {
@@ -176,6 +183,27 @@ export type TutorResponse = {
   voice: { voiceId: string };
 };
 
+export type ChatMessage = {
+  role: "student" | "tutor";
+  text: string;
+  audioUrl?: string;
+};
+
+export type TutorChatResponse = {
+  sessionId: string;
+  reply: string;
+  audioUrl: string | null;
+  model: { provider: string; model: string };
+  voice: { voiceId: string };
+};
+
+export type DrillResponse = {
+  sessionId: string;
+  excerptMidiUrl: string | null;
+  aiDrillMidiUrl: string | null;
+  aiDrillDescription: string | null;
+};
+
 export type FocusArea = {
   bucket: string;
   color: string;
@@ -183,14 +211,19 @@ export type FocusArea = {
   drill: string;
 };
 
-// ===== Shared utility functions =====
-
 export function hasDynamicOutlier(note: AnnotatedReferenceNote): boolean {
+  if (note.dynamicInfo !== null && note.dynamicInfo !== undefined) {
+    return note.dynamicInfo.steps >= 2;
+  }
   return note.dynamicDelta !== null && Math.abs(note.dynamicDelta) > DYNAMIC_DELTA_ALERT_THRESHOLD;
 }
 
 export function dynamicTooltip(note: AnnotatedReferenceNote): string | null {
   if (!hasDynamicOutlier(note)) return null;
+  if (note.dynamicInfo) {
+    const { playedDynamic, refDynamic, steps, direction } = note.dynamicInfo;
+    return `Played ${playedDynamic}, expected ${refDynamic} (${steps} level${steps > 1 ? "s" : ""} ${direction})`;
+  }
   const label =
     note.dynamicLabel ??
     (note.dynamicDelta! > 0 ? "much louder than written" : "much softer than written");

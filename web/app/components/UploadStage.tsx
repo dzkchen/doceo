@@ -138,7 +138,6 @@ function UploadSheet({
       }}
       onClick={hasMeta || disabled ? undefined : () => inputRef.current?.click()}
     >
-      {/* Accept hint in corner */}
       <div
         style={{
           position: "absolute",

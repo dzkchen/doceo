@@ -1,16 +1,18 @@
 "use client";
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   MidiResponse, VideoResponse, AlignResponse, PlayedNote,
   PoseResponse, TutorResponse, FocusArea, AnnotatedReferenceNote,
-  PostureFlag, PostureRule, LandmarkXY, PoseFrame, ReferenceNote, TempoMapEntry,
+  PostureFlag, PostureRule, LandmarkXY, PoseFrame, ReferenceNote, TempoMapEntry, DrillResponse, ChatMessage,
 } from "./types";
 import {
-  DYNAMIC_DELTA_ALERT_THRESHOLD, STATUS_COLORS, DYNAMIC_ALERT_COLOR,
+  STATUS_COLORS, DYNAMIC_ALERT_COLOR,
   POSTURE_RULE_COLORS, hasDynamicOutlier, dynamicTooltip,
   prettyRuleName, midiToNoteName, postureSeverityOpacity,
 } from "./types";
+import { DrillSheet } from "./DrillSheet";
+import { TutorChat } from "./TutorChat";
 
 type ResultsStageProps = {
   midi: MidiResponse;
@@ -19,15 +21,25 @@ type ResultsStageProps = {
   playedNotes: PlayedNote[] | null;
   pose: PoseResponse | null;
   tutor: TutorResponse | null;
+  drill: DrillResponse | null;
   tutorBusy: boolean;
+  chatHistory: ChatMessage[];
+  chatBusy: boolean;
+  tutorChatVisible: boolean;
+  drillBusy: boolean;
   focusAreas: FocusArea[];
   dynamicsOutlierCount: number;
+  dynamicsTooLoud: number;
+  dynamicsTooSoft: number;
   analysisDurationMs: number;
   renderMode: "score" | "piano-roll";
   setRenderMode: (m: "score" | "piano-roll") => void;
   showPoseOverlay: boolean;
   setShowPoseOverlay: (v: boolean) => void;
   onGenerateTutor: () => void;
+  onSendChat: (text: string) => void | Promise<void>;
+  onRevealTutorChat: () => void;
+  onGenerateDrill: () => void;
   onSeekVideo: (onsetMs: number) => void;
   performanceVideoRef: React.RefObject<HTMLVideoElement | null>;
   resolveApiUrl: (path: string) => string;
@@ -37,17 +49,32 @@ type ResultsStageProps = {
 };
 
 export function ResultsStage({
-  midi, video, alignment, playedNotes, pose, tutor, tutorBusy,
-  focusAreas, dynamicsOutlierCount, analysisDurationMs,
+  midi, video, alignment, playedNotes, pose, tutor, drill, tutorBusy, chatHistory, chatBusy, tutorChatVisible, drillBusy,
+  focusAreas, dynamicsOutlierCount, dynamicsTooLoud, dynamicsTooSoft, analysisDurationMs,
   renderMode, setRenderMode, showPoseOverlay, setShowPoseOverlay,
-  onGenerateTutor, onSeekVideo, performanceVideoRef,
+  onGenerateTutor, onSendChat, onRevealTutorChat, onGenerateDrill, onSeekVideo, performanceVideoRef,
   resolveApiUrl, postureWarning, tutorWarning,
 }: ResultsStageProps) {
   const s = alignment.summary;
+  const referenceAudioRef = useRef<HTMLAudioElement>(null);
+
+  function seekBoth(ms: number) {
+    onSeekVideo(ms);
+    if (referenceAudioRef.current) referenceAudioRef.current.currentTime = ms / 1000;
+  }
+  const troubleMeasureNumbers = useMemo(
+    () => identifyTroubleMeasures(alignment.annotatedReferenceNotes, midi.tempoBpm),
+    [alignment.annotatedReferenceNotes, midi.tempoBpm],
+  );
+  const troubleSpotLabel = troubleMeasureNumbers.length > 0
+    ? `Measures ${troubleMeasureNumbers.join(", ")}`
+    : "Most troublesome passage";
+  const practiceTempoLabel = midi.tempoBpm
+    ? `at ${Math.round(midi.tempoBpm * 0.65)} BPM`
+    : "at 65% tempo";
 
   return (
     <div className="col gap-3 fade-in">
-      {/* Warnings */}
       {postureWarning && (
         <div style={{ padding: "10px 14px", background: "rgba(176,122,45,0.08)", border: "1px solid rgba(176,122,45,0.3)", borderRadius: 2, fontSize: 13, color: "var(--sepia)", fontFamily: "var(--mono)" }}>
           {postureWarning}
@@ -59,25 +86,38 @@ export function ResultsStage({
         </div>
       )}
 
-      {/* Header */}
-      <ResultsHeader midi={midi} summary={s} />
+      <ResultsHeader
+        midi={midi}
+        summary={s}
+        drill={drill}
+        drillBusy={drillBusy}
+        onGenerateDrill={onGenerateDrill}
+      />
 
-      {/* Tutor verdict */}
       <TutorVerdict
         tutor={tutor}
         alignment={alignment}
         busy={tutorBusy}
         onGenerate={onGenerateTutor}
+        chatVisible={tutorChatVisible}
+        onRevealChat={onRevealTutorChat}
         resolveUrl={resolveApiUrl}
       />
 
-      {/* Stats strip */}
-      <StatsStrip alignment={alignment} dynamicsOutlierCount={dynamicsOutlierCount} pose={pose} />
+      {tutor && tutorChatVisible && (
+        <TutorChat
+          sessionId={midi.sessionId}
+          history={chatHistory}
+          busy={chatBusy}
+          onSend={onSendChat}
+          resolveUrl={resolveApiUrl}
+        />
+      )}
 
-      {/* Score + A/B playback side by side */}
+      <StatsStrip alignment={alignment} dynamicsOutlierCount={dynamicsOutlierCount} dynamicsTooLoud={dynamicsTooLoud} dynamicsTooSoft={dynamicsTooSoft} pose={pose} />
+
       <div className="row gap-3" style={{ alignItems: "flex-start" }}>
         <div className="col gap-2" style={{ flex: 2.1 }}>
-          {/* Toolbar */}
           <div className="sheet row between center-y" style={{ padding: "10px 16px", gap: 12 }}>
             <span className="serif" style={{ fontSize: 16 }}>Score</span>
             <div
@@ -107,7 +147,7 @@ export function ResultsStage({
               musicxml={midi.musicxml}
               annotatedReferenceNotes={alignment.annotatedReferenceNotes}
               onColoringFailure={() => setRenderMode("piano-roll")}
-              onNoteScrub={onSeekVideo}
+              onNoteScrub={seekBoth}
               videoRef={performanceVideoRef}
             />
           ) : (
@@ -115,11 +155,10 @@ export function ResultsStage({
               referenceNotes={midi.referenceNotes}
               annotatedReferenceNotes={alignment.annotatedReferenceNotes}
               playedNotes={playedNotes}
-              onNoteScrub={onSeekVideo}
+              onNoteScrub={seekBoth}
             />
           )}
 
-          {/* Legend */}
           <div className="row center-y" style={{ gap: 18, flexWrap: "wrap", padding: "0 4px" }}>
             <span className="eyebrow">Legend</span>
             {[
@@ -141,25 +180,21 @@ export function ResultsStage({
             ))}
           </div>
 
-          {/* Tempo map */}
           {alignment.tempoMap && alignment.tempoMap.length >= 2 && (
-            <TempoMapView tempoMap={alignment.tempoMap} onSeekVideo={onSeekVideo} />
+            <TempoMapView tempoMap={alignment.tempoMap} onSeekVideo={seekBoth} />
           )}
 
-          {/* Posture timeline */}
           {pose && (
             <PostureTimelineView
               totalDurationMs={analysisDurationMs}
               postureFlags={pose.postureFlags}
               sampleFps={pose.sampleFps}
-              onFlagClick={onSeekVideo}
+              onFlagClick={seekBoth}
             />
           )}
         </div>
 
-        {/* Right column: video + focus areas */}
         <div className="col gap-2" style={{ flex: 1.05, minWidth: 360 }}>
-          {/* A/B playback */}
           {(video?.videoUrl || midi.referenceAudioUrl) && (
             <div className="sheet col" style={{ padding: 0, overflow: "hidden" }}>
               <div className="row between center-y" style={{ padding: "12px 16px", borderBottom: "1px solid var(--paper-edge)" }}>
@@ -206,6 +241,7 @@ export function ResultsStage({
                 <div className="col" style={{ padding: "10px 16px 14px", borderTop: video?.videoUrl ? "1px solid var(--paper-edge)" : "none", marginTop: video?.videoUrl ? 12 : 0 }}>
                   <span className="eyebrow" style={{ marginBottom: 8 }}>Correct version</span>
                   <audio
+                    ref={referenceAudioRef}
                     controls
                     preload="metadata"
                     src={resolveApiUrl(midi.referenceAudioUrl)}
@@ -221,7 +257,6 @@ export function ResultsStage({
             </div>
           )}
 
-          {/* Focus + drills */}
           {focusAreas.length > 0 && (
             <div className="sheet col" style={{ padding: 24, gap: 18 }}>
               <div className="col" style={{ gap: 4 }}>
@@ -257,18 +292,61 @@ export function ResultsStage({
               </div>
             </div>
           )}
+
+          {midi.isPianoOnly && (
+            <DrillSheet
+              drill={drill}
+              resolveUrl={resolveApiUrl}
+              troubleSpotLabel={troubleSpotLabel}
+              practiceTempoLabel={practiceTempoLabel}
+            />
+          )}
         </div>
       </div>
 
-      {/* Marginalia */}
-      <MarginaliaSection alignment={alignment} playedNotes={playedNotes} />
+      <MarginaliaSection alignment={alignment} playedNotes={playedNotes} onSeekVideo={onSeekVideo} />
     </div>
   );
 }
 
-// ===== ResultsHeader =====
+function identifyTroubleMeasures(
+  annotatedReferenceNotes: AnnotatedReferenceNote[],
+  tempoBpm: number | null,
+): number[] {
+  if (!tempoBpm || tempoBpm <= 0) return [];
 
-function ResultsHeader({ midi, summary }: { midi: MidiResponse; summary: AlignResponse["summary"] }) {
+  const msPerMeasure = (60000 / tempoBpm) * 4;
+  const scores = new Map<number, number>();
+
+  for (const note of annotatedReferenceNotes) {
+    const measureNumber = Math.floor(note.onset_ms / msPerMeasure) + 1;
+    const nextScore = scores.get(measureNumber) ?? 0;
+    let score = nextScore;
+    if (note.status === "wrongPitch" || note.status === "missed") score += 2;
+    if (note.timingStatus === "early" || note.timingStatus === "late") score += 1;
+    scores.set(measureNumber, score);
+  }
+
+  return [...scores.entries()]
+    .filter(([, score]) => score > 0)
+    .sort((a, b) => (b[1] - a[1]) || (a[0] - b[0]))
+    .slice(0, 3)
+    .map(([measureNumber]) => measureNumber);
+}
+
+function ResultsHeader({
+  midi,
+  summary,
+  drill,
+  drillBusy,
+  onGenerateDrill,
+}: {
+  midi: MidiResponse;
+  summary: AlignResponse["summary"];
+  drill: DrillResponse | null;
+  drillBusy: boolean;
+  onGenerateDrill: () => void;
+}) {
   const grade = summary.correct / (summary.referenceCount || 1) >= 0.85 ? "A"
               : summary.correct / (summary.referenceCount || 1) >= 0.70 ? "B"
               : summary.correct / (summary.referenceCount || 1) >= 0.55 ? "C" : "D";
@@ -291,6 +369,11 @@ function ResultsHeader({ midi, summary }: { midi: MidiResponse; summary: AlignRe
             <span className="chip">{midi.noteCount} notes</span>
             <span className="chip">{(midi.durationMs / 1000).toFixed(1)} sec</span>
             {midi.tempoBpm && <span className="chip">♩ = {midi.tempoBpm.toFixed(0)}</span>}
+            {midi.isPianoOnly && (
+              <button className="btn btn-sm" onClick={onGenerateDrill} disabled={drillBusy}>
+                <span>{drillBusy ? "Generating piano drills…" : drill ? "Regenerate piano drills" : "Generate piano drills"}</span>
+              </button>
+            )}
           </div>
         </div>
         <ScoreDial value={Math.round((summary.correct / Math.max(1, summary.referenceCount)) * 100)} grade={grade} />
@@ -299,8 +382,6 @@ function ResultsHeader({ midi, summary }: { midi: MidiResponse; summary: AlignRe
     </div>
   );
 }
-
-// ===== ScoreDial =====
 
 function ScoreDial({ value, grade }: { value: number; grade: string }) {
   const r = 44;
@@ -334,29 +415,35 @@ function ScoreDial({ value, grade }: { value: number; grade: string }) {
   );
 }
 
-// ===== TutorVerdict =====
-
 function TutorVerdict({
-  tutor, alignment, busy, onGenerate, resolveUrl,
+  tutor, alignment, busy, onGenerate, chatVisible, onRevealChat, resolveUrl,
 }: {
   tutor: TutorResponse | null;
   alignment: AlignResponse;
   busy: boolean;
   onGenerate: () => void;
+  chatVisible: boolean;
+  onRevealChat: () => void;
   resolveUrl: (p: string) => string;
 }) {
   const s = alignment.summary;
   return (
     <div className="sheet" style={{ padding: 0, overflow: "hidden" }}>
       <div className="row" style={{ alignItems: "stretch" }}>
-        {/* Left: tutor speaks */}
         <div className="col" style={{ flex: 2, padding: "32px 36px", gap: 16, position: "relative" }}>
           <div className="row between center-y">
             <span className="eyebrow">A patient note from your tutor —</span>
-            <button className="btn btn-sm" onClick={onGenerate} disabled={busy}>
-              <span style={{ fontSize: 12 }}>▶</span>
-              <span>{busy ? "Generating…" : tutor ? "Replay tutor" : "Play tutor feedback"}</span>
-            </button>
+            <div className="row" style={{ gap: 8 }}>
+              {tutor && (
+                <button className="btn btn-sm" onClick={onRevealChat} type="button">
+                  <span>{chatVisible ? "Tutor chat open" : "Ask a follow-up"}</span>
+                </button>
+              )}
+              <button className="btn btn-sm" onClick={onGenerate} disabled={busy} type="button">
+                <span style={{ fontSize: 12 }}>▶</span>
+                <span>{busy ? "Generating…" : tutor ? "Replay tutor" : "Play tutor feedback"}</span>
+              </button>
+            </div>
           </div>
 
           {tutor ? (
@@ -374,6 +461,7 @@ function TutorVerdict({
                 controls
                 preload="auto"
                 src={resolveUrl(tutor.audioUrl)}
+                onEnded={onRevealChat}
                 style={{ width: "100%", marginTop: 8 }}
               />
               {tutor.strengths?.length > 0 && (
@@ -395,14 +483,12 @@ function TutorVerdict({
             </p>
           )}
 
-          {/* Quill ornament */}
           <svg width="48" height="48" viewBox="0 0 48 48" style={{ position: "absolute", bottom: 14, right: 16, opacity: 0.15 }}>
             <path d="M6 42 L20 28 M22 26 L38 10 Q 42 6, 44 6 Q 44 10, 38 14 L24 28 Z" stroke="var(--ink)" strokeWidth="1" fill="none" strokeLinecap="round" strokeLinejoin="round" />
             <path d="M14 34 L18 30 M16 36 L20 32 M18 38 L22 34" stroke="var(--ink)" strokeWidth="0.6" />
           </svg>
         </div>
 
-        {/* Right: alignment summary */}
         <div className="col" style={{ flex: 1, padding: "28px 28px", background: "var(--paper-deep)", borderLeft: "1px solid var(--paper-edge)", gap: 14 }}>
           <span className="eyebrow">Alignment</span>
           <AlignmentBars summary={s} />
@@ -472,22 +558,25 @@ function TimingBar({ summary }: { summary: AlignResponse["summary"] }) {
   );
 }
 
-// ===== StatsStrip =====
-
 function StatsStrip({
-  alignment, dynamicsOutlierCount, pose,
+  alignment, dynamicsOutlierCount, dynamicsTooLoud, dynamicsTooSoft, pose,
 }: {
   alignment: AlignResponse;
   dynamicsOutlierCount: number;
+  dynamicsTooLoud: number;
+  dynamicsTooSoft: number;
   pose: PoseResponse | null;
 }) {
   const s = alignment.summary;
+  const dynamicsSub = dynamicsOutlierCount > 0
+    ? [dynamicsTooLoud > 0 ? `${dynamicsTooLoud} too loud` : null, dynamicsTooSoft > 0 ? `${dynamicsTooSoft} too soft` : null].filter(Boolean).join(" · ") || "outliers"
+    : "none detected";
   const stats = [
     { label: "Notes correct",   value: s.correct,           sub: `of ${s.referenceCount} reference`,  emphasize: false },
     { label: "Wrong pitch",     value: s.wrongPitch,         sub: "notes misidentified",                emphasize: true,  color: "var(--vermilion)" },
     { label: "Missed",          value: s.missed,             sub: "from reference",                     emphasize: false },
     { label: "Tempo drift",     value: s.tempoDeviationPct !== null ? `${s.tempoDeviationPct.toFixed(1)}%` : "n/a", sub: "vs reference", emphasize: false },
-    { label: "Dynamics alerts", value: dynamicsOutlierCount, sub: `|Δvel| > ${DYNAMIC_DELTA_ALERT_THRESHOLD}`, emphasize: false, color: "var(--sepia)" },
+    { label: "Dynamics",        value: dynamicsOutlierCount, sub: dynamicsSub, emphasize: false, color: "var(--sepia)" },
     { label: "Posture flags",   value: pose?.postureSummary.flagCount ?? "—", sub: "across video",     emphasize: false, color: "var(--plum)" },
   ];
   return (
@@ -510,8 +599,6 @@ function StatsStrip({
     </div>
   );
 }
-
-// ===== TempoMapView =====
 
 function TempoMapView({
   tempoMap, onSeekVideo,
@@ -544,7 +631,6 @@ function TempoMapView({
         style={{ display: "block" }}
       >
         <rect x={0} y={0} width={svgW} height={svgH} fill="#faf5e8" />
-        {/* threshold lines at ±10% */}
         {[-10, 10].map((pct) => {
           const y = zeroY - (pct / maxDev) * (drawH / 2);
           return (
@@ -555,9 +641,7 @@ function TempoMapView({
             />
           );
         })}
-        {/* zero line */}
         <line x1={padX} y1={zeroY} x2={padX + drawW} y2={zeroY} stroke="var(--rule)" strokeWidth={1} />
-        {/* bars */}
         {tempoMap.map((entry, idx) => {
           const x = padX + (idx / tempoMap.length) * drawW;
           const dev = entry.deviationPct;
@@ -589,7 +673,6 @@ function TempoMapView({
             </g>
           );
         })}
-        {/* x-axis measure labels — every 4 measures */}
         {tempoMap.filter((e) => e.measureNumber % 4 === 1).map((entry, idx) => {
           const x = padX + ((entry.measureNumber - 1) / tempoMap.length) * drawW;
           return (
@@ -608,8 +691,6 @@ function TempoMapView({
     </div>
   );
 }
-
-// ===== PostureTimelineView =====
 
 function PostureTimelineView({
   totalDurationMs, postureFlags, sampleFps, onFlagClick,
@@ -676,9 +757,8 @@ function PostureTimelineView({
   );
 }
 
-// ===== MarginaliaSection =====
-
-type MarginaliaEntry = { timeMs: number; text: string };
+type MarginaliaType = "wrong pitch" | "missed" | "extra note" | "dynamics";
+type MarginaliaEntry = { timeMs: number; text: string; type: MarginaliaType };
 
 function buildMarginalia(alignment: AlignResponse, playedNotes: PlayedNote[] | null): MarginaliaEntry[] {
   const entries: MarginaliaEntry[] = [];
@@ -688,63 +768,285 @@ function buildMarginalia(alignment: AlignResponse, playedNotes: PlayedNote[] | n
       const expectedName = midiToNoteName(note.pitch);
       const playedNote = playedNotes && note.playedIdx !== null ? playedNotes[note.playedIdx] : null;
       const playedName = playedNote ? midiToNoteName(playedNote.pitch) : "?";
-      entries.push({ timeMs: note.onset_ms, text: `${timeSec}s  wrong pitch  played ${playedName}  expected ${expectedName}` });
+      entries.push({ timeMs: note.onset_ms, type: "wrong pitch", text: `${timeSec}s  wrong pitch  played ${playedName}  expected ${expectedName}` });
     } else if (note.status === "missed") {
-      entries.push({ timeMs: note.onset_ms, text: `${timeSec}s  missed  ${midiToNoteName(note.pitch)}` });
+      entries.push({ timeMs: note.onset_ms, type: "missed", text: `${timeSec}s  missed  ${midiToNoteName(note.pitch)}` });
     } else if (note.status === "extra") {
       const playedNote = playedNotes && note.playedIdx !== null ? playedNotes[note.playedIdx] : null;
       const noteName = playedNote ? `  ${midiToNoteName(playedNote.pitch)}` : "";
-      entries.push({ timeMs: note.onset_ms, text: `${timeSec}s  extra note${noteName}` });
+      entries.push({ timeMs: note.onset_ms, type: "extra note", text: `${timeSec}s  extra note${noteName}` });
     }
     if (hasDynamicOutlier(note)) {
-      const delta = note.dynamicDelta!;
-      const label = note.dynamicLabel ?? (delta > 0 ? "too forceful" : "too soft");
-      entries.push({ timeMs: note.onset_ms, text: `${timeSec}s  dynamics  ${label} (Δ ${delta > 0 ? "+" : ""}${delta})` });
+      const noteName = midiToNoteName(note.pitch);
+      if (note.dynamicInfo) {
+        const { playedDynamic, refDynamic, steps, direction } = note.dynamicInfo;
+        entries.push({ timeMs: note.onset_ms, type: "dynamics", text: `${timeSec}s  dynamics  ${noteName}  played ${playedDynamic}, expected ${refDynamic} (${steps} level${steps > 1 ? "s" : ""} ${direction})` });
+      } else {
+        const delta = note.dynamicDelta!;
+        const label = note.dynamicLabel ?? (delta > 0 ? "too forceful" : "too soft");
+        entries.push({ timeMs: note.onset_ms, type: "dynamics", text: `${timeSec}s  dynamics  ${noteName}  ${label}` });
+      }
     }
   }
   return entries.sort((a, b) => a.timeMs - b.timeMs);
 }
 
+const MARGINALIA_TYPE_COLORS: Record<MarginaliaType, string> = {
+  "wrong pitch": "var(--rust)",
+  "missed": "var(--plum)",
+  "extra note": "var(--sepia)",
+  "dynamics": "var(--sage)",
+};
+
 function MarginaliaSection({
-  alignment, playedNotes,
+  alignment, playedNotes, onSeekVideo,
 }: {
   alignment: AlignResponse;
   playedNotes: PlayedNote[] | null;
+  onSeekVideo: (ms: number) => void;
 }) {
   const entries = useMemo(() => buildMarginalia(alignment, playedNotes), [alignment, playedNotes]);
+  const dynamicsOutliers = useMemo(
+    () => alignment.annotatedReferenceNotes.filter((n) => hasDynamicOutlier(n) && n.dynamicInfo !== null && n.dynamicInfo !== undefined),
+    [alignment.annotatedReferenceNotes],
+  );
+
+  const presentTypes = useMemo(
+    () => (Object.keys(MARGINALIA_TYPE_COLORS) as MarginaliaType[]).filter((t) => entries.some((e) => e.type === t)),
+    [entries],
+  );
+  const [activeFilters, setActiveFilters] = useState<Set<MarginaliaType>>(new Set());
+
+  const toggleFilter = (type: MarginaliaType) => {
+    setActiveFilters((prev) => {
+      const next = new Set(prev);
+      if (next.has(type)) next.delete(type); else next.add(type);
+      return next;
+    });
+  };
+
+  const visible = activeFilters.size === 0 ? entries : entries.filter((e) => activeFilters.has(e.type));
 
   return (
-    <div className="sheet col" style={{ padding: 24, gap: 16 }}>
-      <div className="col" style={{ gap: 4 }}>
-        <span className="eyebrow">Marginalia</span>
-        <h2 className="section">Every flagged note, in order</h2>
-      </div>
-      <div className="hr" />
-      {entries.length === 0 ? (
-        <p className="serif-i" style={{ color: "var(--ink-mute)", fontSize: 14 }}>No errors detected.</p>
-      ) : (
-        <ol style={{ margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 0 }}>
-          {entries.map((entry, idx) => (
-            <li
-              key={idx}
-              className="mono"
-              style={{
-                fontSize: 13,
-                color: "var(--ink-soft)",
-                padding: "10px 6px",
-                borderBottom: idx < entries.length - 1 ? "1px solid var(--paper-edge)" : "none",
-              }}
-            >
-              {entry.text}
-            </li>
-          ))}
-        </ol>
+    <div className="col" style={{ gap: 12 }}>
+      {dynamicsOutliers.length > 0 && (
+        <DynamicsView
+          annotatedReferenceNotes={alignment.annotatedReferenceNotes}
+          outliers={dynamicsOutliers}
+          onSeekVideo={onSeekVideo}
+        />
       )}
+      <div className="sheet col" style={{ padding: 24, gap: 16 }}>
+        <div className="col" style={{ gap: 4 }}>
+          <span className="eyebrow">Marginalia</span>
+          <h2 className="section">Every flagged note, in order</h2>
+        </div>
+        <div className="hr" />
+        {presentTypes.length > 1 && (
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {presentTypes.map((type) => {
+              const active = activeFilters.has(type);
+              const color = MARGINALIA_TYPE_COLORS[type];
+              return (
+                <button
+                  key={type}
+                  onClick={() => toggleFilter(type)}
+                  className="mono"
+                  style={{
+                    fontSize: 11,
+                    padding: "3px 10px",
+                    borderRadius: 99,
+                    border: `1px solid ${color}`,
+                    background: active ? color : "transparent",
+                    color: active ? "var(--paper)" : color,
+                    cursor: "pointer",
+                    transition: "background 0.15s, color 0.15s",
+                  }}
+                >
+                  {type}
+                </button>
+              );
+            })}
+            {activeFilters.size > 0 && (
+              <button
+                onClick={() => setActiveFilters(new Set())}
+                className="mono"
+                style={{
+                  fontSize: 11,
+                  padding: "3px 10px",
+                  borderRadius: 99,
+                  border: "1px solid var(--ink-mute)",
+                  background: "transparent",
+                  color: "var(--ink-mute)",
+                  cursor: "pointer",
+                }}
+              >
+                clear
+              </button>
+            )}
+          </div>
+        )}
+        {visible.length === 0 ? (
+          <p className="serif-i" style={{ color: "var(--ink-mute)", fontSize: 14 }}>
+            {entries.length === 0 ? "No errors detected." : "No entries match the selected filters."}
+          </p>
+        ) : (
+          <ol style={{ margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 0 }}>
+            {visible.map((entry, idx) => (
+              <li
+                key={idx}
+                className="mono"
+                style={{
+                  fontSize: 13,
+                  color: "var(--ink-soft)",
+                  padding: "10px 6px",
+                  borderBottom: idx < visible.length - 1 ? "1px solid var(--paper-edge)" : "none",
+                  borderLeft: `2px solid ${MARGINALIA_TYPE_COLORS[entry.type]}`,
+                  paddingLeft: 10,
+                }}
+              >
+                {entry.text}
+              </li>
+            ))}
+          </ol>
+        )}
+      </div>
     </div>
   );
 }
 
-// ===== ScoreView (OSMD) =====
+function DynamicsView({
+  annotatedReferenceNotes, outliers, onSeekVideo,
+}: {
+  annotatedReferenceNotes: AnnotatedReferenceNote[];
+  outliers: AnnotatedReferenceNote[];
+  onSeekVideo: (ms: number) => void;
+}) {
+  const [open, setOpen] = useState(true);
+
+  const svgW = 980, svgH = 80, padX = 20, padY = 10;
+  const drawW = svgW - padX * 2, drawH = svgH - padY * 2;
+
+  const notes = useMemo(
+    () => annotatedReferenceNotes.filter((n) => n.dynamicDelta !== null || n.dynamicInfo !== null),
+    [annotatedReferenceNotes],
+  );
+
+  const maxTime = useMemo(
+    () => Math.max(1, ...annotatedReferenceNotes.map((n) => n.onset_ms)),
+    [annotatedReferenceNotes],
+  );
+
+  const refPoints = notes.map((n) => {
+    const x = padX + (n.onset_ms / maxTime) * drawW;
+    const y = padY + drawH - (n.velocity / 127) * drawH;
+    return `${x},${y}`;
+  }).join(" ");
+
+  const playedPoints = notes.map((n) => {
+    const playedVel = n.dynamicDelta !== null ? n.velocity + n.dynamicDelta : n.velocity;
+    const x = padX + (n.onset_ms / maxTime) * drawW;
+    const y = padY + drawH - (Math.max(1, Math.min(127, playedVel)) / 127) * drawH;
+    return `${x},${y}`;
+  }).join(" ");
+
+  return (
+    <div className="sheet col" style={{ padding: 0, overflow: "hidden" }}>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          display: "flex", alignItems: "center", gap: 10,
+          padding: "12px 20px", background: "none", border: "none",
+          borderBottom: open ? "1px solid var(--paper-edge)" : "none",
+          cursor: "pointer", width: "100%", textAlign: "left",
+        }}
+      >
+        <span className="eyebrow" style={{ flex: 1 }}>Dynamics</span>
+        <span style={{ fontSize: 11, color: "var(--sepia)", fontFamily: "var(--mono)" }}>
+          {outliers.filter((n) => n.dynamicInfo?.direction === "too loud").length} too loud ·{" "}
+          {outliers.filter((n) => n.dynamicInfo?.direction === "too soft").length} too soft
+        </span>
+        <span style={{ fontSize: 12, color: "var(--ink-mute)", marginLeft: 8 }}>{open ? "▾" : "▸"}</span>
+      </button>
+
+      {open && (
+        <div className="col" style={{ gap: 0 }}>
+          <div style={{ padding: "12px 20px 8px" }}>
+            <svg
+              width="100%"
+              viewBox={`0 0 ${svgW} ${svgH}`}
+              style={{ display: "block" }}
+              aria-label="Dynamics curve"
+            >
+              <rect x={0} y={0} width={svgW} height={svgH} fill="#faf5e8" />
+              {notes.length > 1 && (
+                <>
+                  <polyline points={refPoints} fill="none" stroke="var(--ink-faint)" strokeWidth={1.5} strokeDasharray="4 3" />
+                  <polyline points={playedPoints} fill="none" stroke="var(--sepia)" strokeWidth={1.5} />
+                </>
+              )}
+              {outliers.map((n, i) => {
+                const x = padX + (n.onset_ms / maxTime) * drawW;
+                const playedVel = n.dynamicDelta !== null ? n.velocity + n.dynamicDelta : n.velocity;
+                const refY = padY + drawH - (n.velocity / 127) * drawH;
+                const playedY = padY + drawH - (Math.max(1, Math.min(127, playedVel)) / 127) * drawH;
+                const topY = Math.min(refY, playedY);
+                const botY = Math.max(refY, playedY);
+                return (
+                  <rect
+                    key={i}
+                    x={x - 2} y={topY} width={5} height={Math.max(2, botY - topY)}
+                    fill="rgba(176,122,45,0.35)"
+                    style={{ cursor: "pointer" }}
+                    onClick={() => onSeekVideo(n.onset_ms)}
+                  />
+                );
+              })}
+            </svg>
+            <div className="row" style={{ gap: 16, paddingTop: 4 }}>
+              <div className="row center-y" style={{ gap: 6, fontSize: 11, color: "var(--ink-mute)" }}>
+                <svg width={20} height={8}><line x1={0} y1={4} x2={20} y2={4} stroke="var(--ink-faint)" strokeWidth={1.5} strokeDasharray="4 3" /></svg>
+                Reference
+              </div>
+              <div className="row center-y" style={{ gap: 6, fontSize: 11, color: "var(--ink-mute)" }}>
+                <svg width={20} height={8}><line x1={0} y1={4} x2={20} y2={4} stroke="var(--sepia)" strokeWidth={1.5} /></svg>
+                Played
+              </div>
+            </div>
+          </div>
+
+          <div style={{ borderTop: "1px solid var(--paper-edge)" }}>
+            {outliers.map((n, i) => {
+              const info = n.dynamicInfo!;
+              const noteName = midiToNoteName(n.pitch);
+              const timeSec = (n.onset_ms / 1000).toFixed(1);
+              return (
+                <div
+                  key={i}
+                  className="row between center-y mono"
+                  style={{
+                    fontSize: 12, padding: "9px 20px",
+                    borderBottom: i < outliers.length - 1 ? "1px solid var(--paper-edge)" : "none",
+                    cursor: "pointer",
+                    color: "var(--ink-soft)",
+                  }}
+                  onClick={() => onSeekVideo(n.onset_ms)}
+                  onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.background = "rgba(176,122,45,0.06)"; }}
+                  onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = ""; }}
+                >
+                  <span>{noteName} @ {timeSec}s</span>
+                  <span style={{ color: info.direction === "too loud" ? "var(--sepia)" : "var(--slate)" }}>
+                    played {info.playedDynamic}, expected {info.refDynamic} — {info.steps} level{info.steps > 1 ? "s" : ""} {info.direction}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 type OsmdLike = {
   Sheet?: { SourceMeasures?: Array<{ VerticalSourceStaffEntryContainers?: Array<{ StaffEntries?: Array<{ VoiceEntries?: Array<{ Notes?: unknown[] } | null> } | null> }> }> };
@@ -796,10 +1098,8 @@ function applyAlignmentColors(osmd: OsmdLike, annotatedReferenceNotes: Annotated
 }
 
 type NoteTimeEntry = { onset_ms: number; element: SVGGElement };
+type ClickMapEntry = { onset_ms: number; contentX: number };
 
-// Builds the noteTimeMap and applies visual affordances to note groups.
-// Click/seek is handled at the container level (see ScoreView) to avoid
-// pointer-events issues inside OSMD's SVG tree.
 function buildNoteTimeMap(
   osmd: OsmdLike,
   annotatedReferenceNotes: AnnotatedReferenceNote[],
@@ -838,21 +1138,18 @@ function ScoreView({
   onNoteScrub: (ms: number) => void;
   videoRef?: React.RefObject<HTMLVideoElement | null>;
 }) {
-  // outerRef  — scroll container + click target; position:relative for cursor
-  // osmdRef   — div OSMD renders into (innerHTML cleared on re-render)
-  // cursorRef — the red vertical line div
   const outerRef  = useRef<HTMLDivElement>(null);
   const osmdRef   = useRef<HTMLDivElement>(null);
   const cursorRef = useRef<HTMLDivElement>(null);
   const noteTimeMapRef = useRef<NoteTimeEntry[]>([]);
+  const clickMapRef = useRef<ClickMapEntry[]>([]);
 
-  // Keep a stable ref to onNoteScrub so the click/cursor effects don't re-register
   const onNoteScrubRef = useRef(onNoteScrub);
   useEffect(() => { onNoteScrubRef.current = onNoteScrub; });
 
-  // OSMD rendering
   useEffect(() => {
     const osmdContainer = osmdRef.current;
+    const cursor = cursorRef.current;
     if (!osmdContainer) return;
     let cancelled = false;
     noteTimeMapRef.current = [];
@@ -870,7 +1167,24 @@ function ScoreView({
         inst.render();
         if (annotatedReferenceNotes?.length) {
           applyAlignmentColors(inst as unknown as OsmdLike, annotatedReferenceNotes, "post-render");
-          noteTimeMapRef.current = buildNoteTimeMap(inst as unknown as OsmdLike, annotatedReferenceNotes);
+          const allEntries = buildNoteTimeMap(inst as unknown as OsmdLike, annotatedReferenceNotes);
+          noteTimeMapRef.current = allEntries;
+          // Snapshot error-note positions while elements are still attached (before autoResize replaces them)
+          const outer = outerRef.current;
+          if (outer) {
+            const outerRect = outer.getBoundingClientRect();
+            const byOnset = new Map(annotatedReferenceNotes.map((n) => [n.onset_ms, n]));
+            clickMapRef.current = allEntries
+              .filter((e) => {
+                const ann = byOnset.get(e.onset_ms);
+                return ann && (ann.status !== "correct" || hasDynamicOutlier(ann));
+              })
+              .map((e) => {
+                const r = e.element.getBoundingClientRect();
+                const contentX = r.left + r.width / 2 - outerRect.left + outer.scrollLeft;
+                return { onset_ms: e.onset_ms, contentX };
+              });
+          }
         }
       } catch (e) {
         osmdContainer.innerHTML = `<p style="color:var(--vermilion)">Failed to render score: ${(e as Error).message}</p>`;
@@ -881,44 +1195,39 @@ function ScoreView({
     return () => {
       cancelled = true;
       noteTimeMapRef.current = [];
-      if (cursorRef.current) cursorRef.current.style.display = "none";
+      clickMapRef.current = [];
+      if (cursor) cursor.style.display = "none";
       osmdContainer.innerHTML = "";
     };
   }, [musicxml, annotatedReferenceNotes, onColoringFailure]);
 
-  // Container-level click → seek nearest note.
-  // Using a container handler bypasses any pointer-events:none on OSMD's SVG elements.
   useEffect(() => {
     const outer = outerRef.current;
     if (!outer) return;
 
     function handleClick(e: MouseEvent) {
-      const map = noteTimeMapRef.current;
-      if (!map.length) return;
+      const clickMap = clickMapRef.current;
+      if (!clickMap.length) return;
       const outerRect = outer!.getBoundingClientRect();
-      // Convert viewport click x to scroll-content x
       const clickX = e.clientX - outerRect.left + outer!.scrollLeft;
 
-      let bestNote = map[0];
+      let bestOnsetMs = clickMap[0].onset_ms;
       let bestDist = Infinity;
-      for (const entry of map) {
-        const r = entry.element.getBoundingClientRect();
-        if (r.width === 0 && r.height === 0) continue;
-        const entryX = r.left + r.width / 2 - outerRect.left + outer!.scrollLeft;
-        const dist = Math.abs(entryX - clickX);
-        if (dist < bestDist) { bestDist = dist; bestNote = entry; }
+      for (const entry of clickMap) {
+        const dist = Math.abs(entry.contentX - clickX);
+        if (dist < bestDist) { bestDist = dist; bestOnsetMs = entry.onset_ms; }
       }
-      onNoteScrubRef.current(bestNote.onset_ms);
+      onNoteScrubRef.current(bestOnsetMs);
     }
 
     outer.addEventListener("click", handleClick);
     return () => outer.removeEventListener("click", handleClick);
-  }, []); // stable — reads only refs
+  }, []);
 
-  // Cursor tracking: moves the red div to the current note's screen x on each timeupdate
   useEffect(() => {
     const video = videoRef?.current;
     if (!video) return;
+    const cursor = cursorRef.current;
     let rafId: number | null = null;
 
     function moveCursor() {
@@ -938,7 +1247,6 @@ function ScoreView({
       if (noteRect.width === 0 && noteRect.height === 0) return;
 
       const outerRect = outer.getBoundingClientRect();
-      // Content x (accounts for horizontal scroll)
       const noteX = noteRect.left + noteRect.width / 2 - outerRect.left + outer.scrollLeft;
       cursor.style.left = `${noteX - 1}px`;
       cursor.style.display = "block";
@@ -953,7 +1261,7 @@ function ScoreView({
     return () => {
       video.removeEventListener("timeupdate", onTimeUpdate);
       if (rafId !== null) cancelAnimationFrame(rafId);
-      if (cursorRef.current) cursorRef.current.style.display = "none";
+      if (cursor) cursor.style.display = "none";
     };
   }, [videoRef]);
 
@@ -970,7 +1278,6 @@ function ScoreView({
       }}
     >
       <div ref={osmdRef} style={{ padding: "28px 32px" }} />
-      {/* Cursor line — HTML div to avoid SVG coordinate system issues */}
       <div
         ref={cursorRef}
         style={{
@@ -987,8 +1294,6 @@ function ScoreView({
     </div>
   );
 }
-
-// ===== PianoRollView =====
 
 function PianoRollView({
   referenceNotes, annotatedReferenceNotes, playedNotes, onNoteScrub,
@@ -1059,8 +1364,6 @@ function PianoRollView({
     </div>
   );
 }
-
-// ===== PoseOverlay =====
 
 function PoseOverlay({
   videoRef, frames,

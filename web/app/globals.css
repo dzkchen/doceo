@@ -1,13 +1,7 @@
 @import "tailwindcss";
 
-/* ============================================================
-   Doceo — CSS custom properties + utility classes
-   ============================================================ */
-
 :root {
   color-scheme: light;
-
-  /* Paper & ink palette */
   --paper:         #f3ecdc;
   --paper-deep:    #ebe2cc;
   --paper-edge:    #ddd0b3;
@@ -17,7 +11,6 @@
   --ink-faint:     #9a8e7e;
   --rule:          #c8b994;
 
-  /* Annotation colors */
   --vermilion:     #c0341d;
   --vermilion-soft:#d4604f;
   --sepia:         #b07a2d;
@@ -26,12 +19,10 @@
   --moss:          #5e6b3a;
   --plum:          #6b3e6e;
 
-  /* Font families — resolved from next/font CSS vars */
   --serif: var(--font-cormorant, 'Georgia', serif);
   --sans:  var(--font-inter, system-ui, sans-serif);
   --mono:  var(--font-jetbrains, ui-monospace, monospace);
 
-  /* Spacing scale */
   --pad-1: 8px;
   --pad-2: 16px;
   --pad-3: 24px;
@@ -39,7 +30,6 @@
   --pad-5: 56px;
 }
 
-/* Tailwind theme tokens */
 @theme inline {
   --color-background: var(--paper);
   --color-foreground: var(--ink);
@@ -47,7 +37,6 @@
   --font-mono: var(--font-jetbrains, ui-monospace, monospace);
 }
 
-/* Base reset — in @layer base so Tailwind preflight doesn't win */
 @layer base {
   *, *::before, *::after { box-sizing: border-box; }
 
@@ -67,7 +56,6 @@
   }
 }
 
-/* Subtle paper grain overlay */
 body::before {
   content: "";
   position: fixed;
@@ -80,7 +68,6 @@ body::before {
   mix-blend-mode: multiply;
 }
 
-/* ===== Typography ===== */
 .serif    { font-family: var(--serif); font-weight: 500; letter-spacing: -0.005em; }
 .serif-i  { font-family: var(--serif); font-style: italic; font-weight: 400; }
 .mono     { font-family: var(--mono); font-feature-settings: "tnum"; }
@@ -111,7 +98,6 @@ h2.section {
   margin: 0;
 }
 
-/* ===== Buttons ===== */
 .btn {
   font-family: var(--sans);
   font-size: 14px;
@@ -147,7 +133,6 @@ h2.section {
 .btn:disabled:hover { background: var(--paper); color: var(--ink); }
 .btn-primary:disabled:hover { background: var(--ink); border-color: var(--ink); }
 
-/* ===== Cards (paper sheets) ===== */
 .sheet {
   background: #faf5e8;
   border: 1px solid var(--paper-edge);
@@ -159,7 +144,6 @@ h2.section {
 }
 .sheet-padded { padding: var(--pad-4); }
 
-/* ===== Rules ===== */
 .double-rule {
   border-top: 1px solid var(--rule);
   border-bottom: 1px solid var(--rule);
@@ -172,7 +156,6 @@ h2.section {
   margin: 0;
 }
 
-/* ===== Layout ===== */
 .frame {
   position: relative;
   z-index: 1;
@@ -181,7 +164,6 @@ h2.section {
   padding: 28px 40px 80px;
 }
 
-/* ===== Chips ===== */
 .chip {
   display: inline-flex;
   align-items: center;
@@ -199,7 +181,6 @@ h2.section {
 .chip-sepia     { color: var(--sepia);     border-color: rgba(176,122,45,0.3); background: rgba(176,122,45,0.06); }
 .chip-moss      { color: var(--moss);      border-color: rgba(94,107,58,0.3);  background: rgba(94,107,58,0.06); }
 
-/* ===== Dropzone ===== */
 .dropzone {
   border: 1.5px dashed var(--rule);
   border-radius: 2px;
@@ -212,7 +193,6 @@ h2.section {
 .dropzone:hover { border-color: var(--ink-soft); background: rgba(255,250,235,0.8); }
 .dropzone.has-file { border-style: solid; border-color: var(--moss); }
 
-/* Step number */
 .step-num {
   font-family: var(--serif);
   font-style: italic;
@@ -221,7 +201,6 @@ h2.section {
   line-height: 1;
 }
 
-/* ===== Posture bars ===== */
 .posture-track {
   position: relative;
   height: 14px;
@@ -237,7 +216,6 @@ h2.section {
   border-radius: 0;
 }
 
-/* ===== Piano roll ===== */
 .roll-stage {
   position: relative;
   background:
@@ -261,15 +239,12 @@ h2.section {
 }
 .roll-note:hover { transform: translateY(-1px); filter: brightness(1.05); }
 
-/* Clickable SVG note rects in piano roll */
 .scrub-note { transition: filter .1s ease, opacity .1s ease; }
 .scrub-note:hover { filter: brightness(1.35) !important; opacity: 1 !important; }
 
-/* Tempo map bars */
 .tempo-bar { transition: filter .1s ease; }
 .tempo-bar:hover { filter: brightness(1.25); }
 
-/* ===== Animations ===== */
 @keyframes shimmer {
   0%   { background-position: -200% 0; }
   100% { background-position:  200% 0; }
@@ -316,13 +291,11 @@ h2.section {
 }
 .fade-in { animation: fadeIn .5s ease; }
 
-/* ===== Custom scrollbar ===== */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--paper-edge); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--rule); }
 
-/* ===== Layout utilities — in @layer components to work with Tailwind 4 ===== */
 @layer components {
   .row      { display: flex; flex-direction: row; }
   .col      { display: flex; flex-direction: column; }
@@ -336,6 +309,5 @@ h2.section {
   .between  { justify-content: space-between; }
 }
 
-/* Density variants */
 [data-density="compact"]  { --pad-3: 16px; --pad-4: 24px; --pad-5: 36px; }
 [data-density="spacious"] { --pad-3: 32px; --pad-4: 48px; --pad-5: 72px; }

@@ -9,11 +9,11 @@ import { AnalyzingStage } from "./components/AnalyzingStage";
 import { ResultsStage } from "./components/ResultsStage";
 import type {
   MidiResponse, VideoResponse, PlayedNote, AlignResponse,
-  PoseResponse, TutorResponse, FocusArea,
+  PoseResponse, TutorResponse, FocusArea, DrillResponse, ChatMessage, TutorChatResponse,
 } from "./components/types";
+import { hasDynamicOutlier } from "./components/types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-const DYNAMIC_DELTA_ALERT_THRESHOLD = 40;
 
 function resolveApiUrl(path: string): string {
   if (path.startsWith("http://") || path.startsWith("https://")) return path;
@@ -27,7 +27,11 @@ export default function Home() {
   const [playedNotes, setPlayedNotes] = useState<PlayedNote[] | null>(null);
   const [pose,  setPose]  = useState<PoseResponse | null>(null);
   const [tutor, setTutor] = useState<TutorResponse | null>(null);
-  const [busy,  setBusy]  = useState<"midi" | "video" | "analyze" | "tutor" | null>(null);
+  const [drill, setDrill] = useState<DrillResponse | null>(null);
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
+  const [chatBusy, setChatBusy] = useState(false);
+  const [tutorChatVisible, setTutorChatVisible] = useState(false);
+  const [busy,  setBusy]  = useState<"midi" | "video" | "analyze" | "tutor" | "drill" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [postureWarning,  setPostureWarning]  = useState<string | null>(null);
   const [tutorWarning,    setTutorWarning]    = useState<string | null>(null);
@@ -43,7 +47,8 @@ export default function Home() {
 
   async function uploadMidi(file: File) {
     setBusy("midi"); setError(null);
-    setAlignment(null); setPlayedNotes(null); setPose(null); setTutor(null); setVideo(null); setMidi(null);
+    setAlignment(null); setPlayedNotes(null); setPose(null); setTutor(null); setDrill(null); setVideo(null); setMidi(null);
+    setChatHistory([]); setChatBusy(false); setTutorChatVisible(false);
     setPostureWarning(null); setTutorWarning(null);
     try {
       const fd = new FormData();
@@ -61,7 +66,8 @@ export default function Home() {
   async function uploadVideo(file: File) {
     if (!midi) return;
     setBusy("video"); setError(null);
-    setAlignment(null); setPlayedNotes(null); setPose(null); setTutor(null);
+    setAlignment(null); setPlayedNotes(null); setPose(null); setTutor(null); setDrill(null);
+    setChatHistory([]); setChatBusy(false); setTutorChatVisible(false);
     setPostureWarning(null); setTutorWarning(null);
     try {
       const fd = new FormData();
@@ -80,7 +86,8 @@ export default function Home() {
   async function runAnalysis() {
     if (!midi || !video) return;
     setBusy("analyze"); setError(null);
-    setAlignment(null); setPlayedNotes(null); setPose(null); setTutor(null);
+    setAlignment(null); setPlayedNotes(null); setPose(null); setTutor(null); setDrill(null);
+    setChatHistory([]); setChatBusy(false); setTutorChatVisible(false);
     setPostureWarning(null); setTutorWarning(null);
     try {
       const analyzeRes = await fetch(`${API_BASE}/analyze`, {
@@ -142,6 +149,58 @@ export default function Home() {
     }
   }
 
+  async function sendChatMessage(text: string) {
+    if (!midi) return;
+    const message = text.trim();
+    if (!message || chatBusy) return;
+    setChatBusy(true);
+    setTutorWarning(null);
+    try {
+      const res = await fetch(`${API_BASE}/tutor/chat`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sessionId: midi.sessionId,
+          message,
+          history: chatHistory,
+        }),
+      });
+      if (!res.ok) throw new Error(`Tutor chat failed (${res.status}): ${await res.text()}`);
+      const payload = (await res.json()) as TutorChatResponse;
+      const nextMessages: ChatMessage[] = [
+        { role: "student", text: message },
+        { role: "tutor", text: payload.reply, ...(payload.audioUrl ? { audioUrl: payload.audioUrl } : {}) },
+      ];
+      setChatHistory((current) => [...current, ...nextMessages]);
+      setTutorChatVisible(true);
+    } catch (e) {
+      setTutorWarning(`Tutor chat unavailable: ${(e as Error).message}`);
+    } finally {
+      setChatBusy(false);
+    }
+  }
+
+  async function generateDrill() {
+    if (!midi || !alignment) return;
+    if (!midi.isPianoOnly) {
+      setError("Drill generation is only available for piano reference MIDI.");
+      return;
+    }
+    setBusy("drill"); setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/drill`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId: midi.sessionId, type: "both" }),
+      });
+      if (!res.ok) throw new Error(`Drill generation failed (${res.status}): ${await res.text()}`);
+      setDrill((await res.json()) as DrillResponse);
+    } catch (e) {
+      setError(`Drill generation failed: ${(e as Error).message}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function seekPerformanceVideo(onsetMs: number) {
     const player = performanceVideoRef.current;
     if (!player) return;
@@ -150,14 +209,27 @@ export default function Home() {
 
   function reset() {
     setMidi(null); setVideo(null); setAlignment(null); setPlayedNotes(null);
-    setPose(null); setTutor(null); setBusy(null); setError(null);
+    setPose(null); setTutor(null); setDrill(null); setBusy(null); setError(null);
+    setChatHistory([]); setChatBusy(false); setTutorChatVisible(false);
     setPostureWarning(null); setTutorWarning(null);
   }
 
   const dynamicsOutlierCount = useMemo(() => {
     if (!alignment) return 0;
+    return alignment.annotatedReferenceNotes.filter(hasDynamicOutlier).length;
+  }, [alignment]);
+
+  const dynamicsTooLoud = useMemo(() => {
+    if (!alignment) return 0;
     return alignment.annotatedReferenceNotes.filter(
-      (n) => n.dynamicDelta !== null && Math.abs(n.dynamicDelta) > DYNAMIC_DELTA_ALERT_THRESHOLD,
+      (n) => hasDynamicOutlier(n) && (n.dynamicInfo?.direction === "too loud" || (n.dynamicInfo === null && (n.dynamicDelta ?? 0) > 0)),
+    ).length;
+  }, [alignment]);
+
+  const dynamicsTooSoft = useMemo(() => {
+    if (!alignment) return 0;
+    return alignment.annotatedReferenceNotes.filter(
+      (n) => hasDynamicOutlier(n) && (n.dynamicInfo?.direction === "too soft" || (n.dynamicInfo === null && (n.dynamicDelta ?? 0) < 0)),
     ).length;
   }, [alignment]);
 
@@ -174,7 +246,13 @@ export default function Home() {
     const areas: FocusArea[] = [];
     if (s.wrongPitch + s.missed > 0) areas.push({ bucket: "Note Accuracy", color: "#2563eb", summary: `${s.wrongPitch} wrong-pitch and ${s.missed} missed notes`, drill: `${s.wrongPitch} wrong-pitch and ${s.missed} missed notes detected. Mark those passages and play at 40% tempo — hands separately — until clean.` });
     if (areas.length < 3 && s.early + s.late > 0) areas.push({ bucket: "Timing", color: "#d97706", summary: `${s.early} early and ${s.late} late notes (±${s.timingThresholdMs}ms window)`, drill: `Set a metronome to 60% of target tempo and focus on landing each note exactly on the click.` });
-    if (areas.length < 3 && dynamicsOutlierCount > 0) areas.push({ bucket: "Dynamics", color: "#ea580c", summary: `${dynamicsOutlierCount} notes played significantly louder or softer than written`, drill: `Compare performance against reference audio, then replay focusing on matching written velocity.` });
+    if (areas.length < 3 && dynamicsOutlierCount > 0) {
+      const parts = [];
+      if (dynamicsTooLoud > 0) parts.push(`${dynamicsTooLoud} too loud`);
+      if (dynamicsTooSoft > 0) parts.push(`${dynamicsTooSoft} too soft`);
+      const summary = parts.length > 0 ? parts.join(" · ") : `${dynamicsOutlierCount} dynamics outliers`;
+      areas.push({ bucket: "Dynamics", color: "#ea580c", summary, drill: `Compare performance against reference audio, then replay focusing on matching written dynamics.` });
+    }
     if (areas.length < 3 && pose && pose.postureSummary.flagCount > 0) {
       const topEntry = Object.entries(pose.postureSummary.byType).sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0))[0];
       const topIssueType = topEntry ? topEntry[0].replaceAll("_", " ") : "posture";
@@ -184,7 +262,7 @@ export default function Home() {
       areas.push({ bucket: "Tempo", color: "#059669", summary: `Overall tempo drifted ${s.tempoDeviationPct.toFixed(1)}% from reference`, drill: `Run the piece with a metronome locked to the target BPM, counting out loud to anchor the beat.` });
     }
     return areas;
-  }, [alignment, pose, dynamicsOutlierCount]);
+  }, [alignment, pose, dynamicsOutlierCount, dynamicsTooLoud, dynamicsTooSoft]);
 
   return (
     <div className="frame">
@@ -213,15 +291,25 @@ export default function Home() {
           playedNotes={playedNotes}
           pose={pose}
           tutor={tutor}
+          drill={drill}
           tutorBusy={busy === "tutor"}
+          chatHistory={chatHistory}
+          chatBusy={chatBusy}
+          tutorChatVisible={tutorChatVisible}
+          drillBusy={busy === "drill"}
           focusAreas={focusAreas}
           dynamicsOutlierCount={dynamicsOutlierCount}
+          dynamicsTooLoud={dynamicsTooLoud}
+          dynamicsTooSoft={dynamicsTooSoft}
           analysisDurationMs={analysisDurationMs}
           renderMode={renderMode}
           setRenderMode={setRenderMode}
           showPoseOverlay={showPoseOverlay}
           setShowPoseOverlay={setShowPoseOverlay}
           onGenerateTutor={generateTutorFeedback}
+          onSendChat={sendChatMessage}
+          onRevealTutorChat={() => setTutorChatVisible(true)}
+          onGenerateDrill={generateDrill}
           onSeekVideo={seekPerformanceVideo}
           performanceVideoRef={performanceVideoRef}
           resolveApiUrl={resolveApiUrl}

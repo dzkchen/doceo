@@ -49,7 +49,6 @@ export function AnalyzingStage({ midi, video }: AnalyzingStageProps) {
       <div className="sheet sheet-padded col gap-3">
         <Waveform />
 
-        {/* Progress rule */}
         <div style={{ position: "relative", height: 2, background: "var(--paper-edge)" }}>
           <div
             style={{
@@ -104,7 +103,6 @@ export function AnalyzingStage({ midi, video }: AnalyzingStageProps) {
         </div>
       </div>
 
-      {/* Fact cards */}
       <div className="row gap-2" style={{ marginTop: 4 }}>
         <FactCard
           label="Reference"

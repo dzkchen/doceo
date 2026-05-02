@@ -26,7 +26,7 @@ from fastdtw import fastdtw
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from music21 import converter
+from music21 import converter, midi as m21midi
 
 STORAGE = Path(__file__).parent / "storage"
 STORAGE.mkdir(exist_ok=True)
@@ -86,6 +86,13 @@ GEMINI_MODEL_CANDIDATES = (
 DEFAULT_TUTOR_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"
 MIN_TUTOR_SECONDS = 15.0
 MIN_TUTOR_WORDS = 45
+MIN_TUTOR_CHAT_SECONDS = 10.0
+MIN_TUTOR_CHAT_WORDS = 30
+DRILL_PRACTICE_TEMPO_RATIO = 0.65
+DRILL_MAX_MEASURES = 3
+DRILL_COUNT_IN_PITCH = 37
+DRILL_COUNT_IN_VELOCITY = 80
+PIANO_PROGRAM_MAX = 7
 
 
 def _session_dir(session_id: str, *, create: bool = False) -> Path:
@@ -271,6 +278,13 @@ def _notes_to_pretty_midi(notes: list[dict[str, int]]) -> pretty_midi.PrettyMIDI
     return pm
 
 
+def _is_piano_only_midi(pm: pretty_midi.PrettyMIDI) -> bool:
+    melodic_instruments = [inst for inst in pm.instruments if not inst.is_drum]
+    if not melodic_instruments:
+        return False
+    return all(0 <= int(inst.program) <= PIANO_PROGRAM_MAX for inst in melodic_instruments)
+
+
 def _alignment_event_distance(ref_event: Any, played_event: Any) -> int:
     pitch_cost = _pitch_distance_cost(int(ref_event[0]), int(played_event[0])) * 6
     timing_delta = abs(int(ref_event[1]) - int(played_event[1]))
@@ -440,6 +454,8 @@ def _resolve_session_media_path(sdir: Path, filename: str, *, allowed_suffixes: 
 def _media_type_for_suffix(suffix: str) -> str:
     mapping = {
         ".mp3": "audio/mpeg",
+        ".mid": "audio/midi",
+        ".midi": "audio/midi",
         ".wav": "audio/wav",
         ".mov": "video/quicktime",
         ".mp4": "video/mp4",
@@ -543,7 +559,6 @@ def _render_with_fluidsynth(pm: pretty_midi.PrettyMIDI, *, sdir: Path) -> Path |
 
 
 def _piano_like_wave(phase: np.ndarray) -> np.ndarray:
-    # Harmonic mix tuned for a mellow piano-like timbre instead of a plain sine.
     return (
         0.72 * np.sin(phase)
         + 0.34 * np.sin(2.0 * phase + 0.015)
@@ -851,11 +866,53 @@ def _load_secret(env_keys: tuple[str, ...], *, legacy_labels: tuple[str, ...] = 
     return None
 
 
+def _piece_name_for_session(sdir: Path) -> str:
+    musicxml_path = sdir / "reference.musicxml"
+    if musicxml_path.exists():
+        try:
+            score = converter.parse(str(musicxml_path))
+            title = getattr(getattr(score, "metadata", None), "title", None)
+            if isinstance(title, str) and title.strip():
+                return title.strip()
+        except Exception:
+            pass
+    return "Reference piece"
+
+
 def _pitch_to_note_name(pitch: int) -> str:
     try:
         return pretty_midi.note_number_to_name(int(pitch))
     except Exception:
         return str(int(pitch))
+
+
+def _velocity_to_dynamic(velocity: int) -> str:
+    v = max(1, min(127, int(velocity)))
+    if v <= 15:   return "ppp"
+    if v <= 31:   return "pp"
+    if v <= 48:   return "p"
+    if v <= 63:   return "mp"
+    if v <= 79:   return "mf"
+    if v <= 95:   return "f"
+    if v <= 111:  return "ff"
+    return "fff"
+
+
+_DYNAMIC_ORDER = ["ppp", "pp", "p", "mp", "mf", "f", "ff", "fff"]
+
+
+def _dynamic_info(ref_velocity: int, played_velocity: int) -> dict[str, Any] | None:
+    ref_dyn = _velocity_to_dynamic(ref_velocity)
+    played_dyn = _velocity_to_dynamic(played_velocity)
+    steps = _DYNAMIC_ORDER.index(played_dyn) - _DYNAMIC_ORDER.index(ref_dyn)
+    if steps == 0:
+        return None
+    return {
+        "refDynamic": ref_dyn,
+        "playedDynamic": played_dyn,
+        "direction": "too loud" if steps > 0 else "too soft",
+        "steps": abs(steps),
+    }
 
 
 def _dynamic_label(delta: int) -> str:
@@ -904,7 +961,10 @@ def _build_tutor_diff(
     wrong_notes: list[dict[str, Any]] = []
     missed_notes: list[dict[str, Any]] = []
     extra_notes: list[dict[str, Any]] = []
-    dynamics_deltas: list[dict[str, Any]] = []
+    dynamics_mistakes: list[dict[str, Any]] = []
+    dynamics_too_loud = 0
+    dynamics_too_soft = 0
+    dynamics_correct = 0
 
     for row in alignment_rows:
         if not isinstance(row, dict):
@@ -942,22 +1002,29 @@ def _build_tutor_diff(
             )
 
         if status in {"correct", "wrongPitch"} and ref_note and played_note:
-            delta = int(played_note["velocity"]) - int(ref_note["velocity"])
-            if abs(delta) > DYNAMIC_DELTA_ALERT_THRESHOLD:
-                dynamics_deltas.append(
+            info = _dynamic_info(ref_note["velocity"], played_note["velocity"])
+            if info is not None and info["steps"] >= 2:
+                dynamics_mistakes.append(
                     {
-                        "timeSec": round(ref_note["onset_ms"] / 1000.0, 2),
-                        "expectedVelocity": int(ref_note["velocity"]),
-                        "playedVelocity": int(played_note["velocity"]),
-                        "delta": delta,
-                        "label": _dynamic_label(delta),
+                        "pitch": int(ref_note["pitch"]),
+                        "onsetMs": int(ref_note["onset_ms"]),
+                        "noteName": _pitch_to_note_name(ref_note["pitch"]),
+                        "played": info["playedDynamic"],
+                        "expected": info["refDynamic"],
+                        "direction": info["direction"],
                     }
                 )
+                if info["direction"] == "too loud":
+                    dynamics_too_loud += 1
+                else:
+                    dynamics_too_soft += 1
+            else:
+                dynamics_correct += 1
 
     wrong_notes.sort(key=lambda note: note["timeSec"])
     missed_notes.sort(key=lambda note: note["timeSec"])
     extra_notes.sort(key=lambda note: note["timeSec"])
-    dynamics_deltas.sort(key=lambda item: abs(int(item["delta"])), reverse=True)
+    dynamics_mistakes.sort(key=lambda item: item["onsetMs"])
 
     posture_flags: list[dict[str, Any]] = []
     if posture_payload:
@@ -997,7 +1064,12 @@ def _build_tutor_diff(
             "early": _safe_int(summary.get("early")),
             "late": _safe_int(summary.get("late")),
         },
-        "dynamicsDeltas": dynamics_deltas[:TUTOR_MAX_DYNAMICS_DELTAS],
+        "dynamicsMistakes": dynamics_mistakes[:TUTOR_MAX_DYNAMICS_DELTAS],
+        "dynamicsProfile": {
+            "tooLoud": dynamics_too_loud,
+            "tooSoft": dynamics_too_soft,
+            "correct": dynamics_correct,
+        },
         "postureFlags": posture_flags[:TUTOR_MAX_POSTURE_FLAGS],
         "alignmentSummary": {
             "correct": _safe_int(summary.get("correct")),
@@ -1063,7 +1135,6 @@ def _count_words(text: str) -> int:
 
 
 def _estimate_tutor_seconds(text: str) -> float:
-    # Typical spoken pacing for tutor feedback sits around ~150 wpm.
     words = _count_words(text)
     if words <= 0:
         return 0.0
@@ -1146,7 +1217,9 @@ def _generate_tutor_script_with_gemini(diff_payload: dict[str, Any]) -> tuple[st
         "\nRequirements for strengths array:\n"
         "- Exactly 3 short, specific observations about what went well.\n"
         "- Each 5-10 words, e.g. 'Expressive rubato in bars 3-5'.\n"
-        "- Base these on timing, dynamics, or correct passages in the diff."
+        "- Base these on timing, dynamics, or correct passages in the diff.\n"
+        "\nDynamics guidance: the diff uses Italian dynamic terms (ppp, pp, p, mp, mf, f, ff, fff). "
+        "Reference these by name when discussing dynamics — e.g. 'your forte in bar 3 should be mezzo-piano'."
     )
     user_prompt = (
         "Performance diff JSON:\n"
@@ -1304,6 +1377,420 @@ def _synthesize_tutor_audio(script: str, *, sdir: Path) -> tuple[str, Path]:
     return voice_id, audio_path
 
 
+def _load_session_context(sdir: Path) -> dict[str, Any]:
+    alignment_payload = _read_json_dict(
+        sdir / "alignment.json",
+        missing_message="missing alignment for session; run /align first",
+        invalid_message="invalid alignment payload in storage",
+    )
+    tutor_payload = _read_json_dict(
+        sdir / "tutor.json",
+        missing_message="missing tutor feedback for session; run /tutor first",
+        invalid_message="invalid tutor payload in storage",
+    )
+
+    posture_payload: dict[str, Any] | None = None
+    posture_path = sdir / "posture.json"
+    if posture_path.exists():
+        posture_payload = _read_json_dict(
+            posture_path,
+            missing_message="",
+            invalid_message="invalid posture payload in storage",
+        )
+
+    alignment_rows = alignment_payload.get("alignment")
+    annotated_notes = alignment_payload.get("annotatedReferenceNotes")
+    summary = alignment_payload.get("summary")
+    if not isinstance(alignment_rows, list) or not isinstance(annotated_notes, list) or not isinstance(summary, dict):
+        raise HTTPException(500, "invalid alignment payload in storage")
+
+    tutor_script = tutor_payload.get("tutorScript")
+    if not isinstance(tutor_script, str) or not tutor_script.strip():
+        raise HTTPException(500, "tutor.json missing tutorScript")
+
+    return {
+        "piece": _piece_name_for_session(sdir),
+        "alignment": alignment_rows,
+        "annotatedReferenceNotes": annotated_notes,
+        "summary": summary,
+        "tempoMap": alignment_payload.get("tempoMap"),
+        "postureFlags": posture_payload.get("postureFlags") if isinstance(posture_payload, dict) else [],
+        "originalFeedback": {
+            "tutorScript": tutor_script.strip(),
+            "writtenNote": tutor_payload.get("writtenNote"),
+            "strengths": tutor_payload.get("strengths"),
+            "diff": tutor_payload.get("diff"),
+        },
+        "voice": tutor_payload.get("voice"),
+    }
+
+
+def _trim_context_for_chat(context: dict[str, Any], history: list[dict[str, str]]) -> dict[str, Any]:
+    alignment_rows = context["alignment"]
+    summary = context["summary"]
+    posture_flags_raw = context.get("postureFlags")
+    tempo_map_raw = context.get("tempoMap")
+
+    extra_events: list[dict[str, Any]] = []
+    if isinstance(alignment_rows, list):
+        for row in alignment_rows:
+            if not isinstance(row, dict):
+                continue
+            status = row.get("status")
+            ref_idx = _safe_int(row.get("refIdx"))
+            event: dict[str, Any] = {
+                "status": status,
+                "timingStatus": row.get("timingStatus"),
+                "timingDeltaMs": _safe_int(row.get("timingDeltaMs")),
+                "pitchDelta": _safe_int(row.get("pitchDelta")),
+                "dynamicDelta": _safe_int(row.get("dynamicDelta")),
+                "dynamicLabel": row.get("dynamicLabel") if isinstance(row.get("dynamicLabel"), str) else None,
+            }
+            if ref_idx is None and status == "extra":
+                extra_events.append(event)
+
+    focus_notes: list[dict[str, Any]] = []
+    raw_notes = context["annotatedReferenceNotes"]
+    if isinstance(raw_notes, list):
+        for note in raw_notes:
+            if not isinstance(note, dict):
+                continue
+            ref_idx = _safe_int(note.get("refIdx"))
+            if ref_idx is None:
+                continue
+            status = str(note.get("status", "correct"))
+            timing_status = note.get("timingStatus") if isinstance(note.get("timingStatus"), str) else None
+            timing_delta = _safe_int(note.get("timingDeltaMs"))
+            dynamic_delta = _safe_int(note.get("dynamicDelta"))
+            score = 0
+            if status == "missed":
+                score += 80
+            elif status == "wrongPitch":
+                score += 70
+            elif status != "correct":
+                score += 50
+            if timing_status in {"early", "late"} and timing_delta is not None:
+                score += min(30, max(8, abs(timing_delta) // 20))
+            if dynamic_delta is not None and abs(dynamic_delta) >= DYNAMIC_DELTA_ALERT_THRESHOLD:
+                score += min(25, abs(dynamic_delta) // 6)
+            if score <= 0:
+                continue
+            focus_notes.append(
+                {
+                    "score": score,
+                    "timeSec": round(int(note.get("onset_ms", 0)) / 1000.0, 2),
+                    "note": _pitch_to_note_name(int(note.get("pitch", 0))),
+                    "status": status,
+                    "timingStatus": timing_status,
+                    "timingDeltaMs": timing_delta,
+                    "pitchDelta": _safe_int(note.get("pitchDelta")),
+                    "dynamicLabel": note.get("dynamicLabel") if isinstance(note.get("dynamicLabel"), str) else None,
+                    "dynamicDelta": dynamic_delta,
+                }
+            )
+
+    focus_notes.sort(key=lambda item: (-item["score"], item["timeSec"], item["note"]))
+
+    posture_flags: list[dict[str, Any]] = []
+    if isinstance(posture_flags_raw, list):
+        severity_rank = {"severe": 3, "moderate": 2, "mild": 1}
+        sortable_flags: list[tuple[int, int, dict[str, Any]]] = []
+        for raw in posture_flags_raw:
+            if not isinstance(raw, dict):
+                continue
+            start_ms = _safe_int(raw.get("startMs"))
+            end_ms = _safe_int(raw.get("endMs"))
+            rule_type = raw.get("type")
+            severity = raw.get("severity")
+            if start_ms is None or not isinstance(rule_type, str) or not isinstance(severity, str):
+                continue
+            duration_ms = max(0, (end_ms if end_ms is not None else start_ms) - start_ms)
+            sortable_flags.append(
+                (
+                    -severity_rank.get(severity, 0),
+                    -duration_ms,
+                    {
+                        "type": rule_type,
+                        "severity": severity,
+                        "startSec": round(start_ms / 1000.0, 2),
+                        "endSec": round((end_ms if end_ms is not None else start_ms) / 1000.0, 2),
+                    },
+                )
+            )
+        sortable_flags.sort()
+        posture_flags = [item[2] for item in sortable_flags[:5]]
+
+    tempo_hotspots: list[dict[str, Any]] = []
+    if isinstance(tempo_map_raw, list):
+        sortable_tempo: list[tuple[float, dict[str, Any]]] = []
+        for raw in tempo_map_raw:
+            if not isinstance(raw, dict):
+                continue
+            measure_number = _safe_int(raw.get("measureNumber"))
+            deviation_pct = _safe_float(raw.get("deviationPct"))
+            start_ms = _safe_int(raw.get("startMs"))
+            if measure_number is None or deviation_pct is None or start_ms is None:
+                continue
+            sortable_tempo.append(
+                (
+                    -abs(deviation_pct),
+                    {
+                        "measure": measure_number,
+                        "deviationPct": round(deviation_pct, 1),
+                        "startSec": round(start_ms / 1000.0, 2),
+                    },
+                )
+            )
+        sortable_tempo.sort(key=lambda item: item[0])
+        tempo_hotspots = [item[1] for item in sortable_tempo[:5]]
+
+    compact_context = {
+        "piece": context["piece"],
+        "alignmentSummary": {
+            "correct": _safe_int(summary.get("correct")),
+            "wrongPitch": _safe_int(summary.get("wrongPitch")),
+            "missed": _safe_int(summary.get("missed")),
+            "extra": _safe_int(summary.get("extra")),
+        },
+        "timingSummary": {
+            "thresholdMs": _safe_int(summary.get("timingThresholdMs")),
+            "early": _safe_int(summary.get("early")),
+            "late": _safe_int(summary.get("late")),
+            "onTime": _safe_int(summary.get("onTime")),
+            "tempoDeviationPct": _safe_float(summary.get("tempoDeviationPct")),
+        },
+        "focusNotes": [
+            {key: value for key, value in item.items() if key != "score"}
+            for item in focus_notes[:15]
+        ],
+        "extraNotes": extra_events[:5],
+        "tempoHotspots": tempo_hotspots,
+        "postureFlags": posture_flags,
+        "originalDiff": context["originalFeedback"].get("diff"),
+        "recentTurns": history[-6:],
+    }
+    return compact_context
+
+
+def _coerce_chat_history(raw_history: Any) -> list[dict[str, str]]:
+    if raw_history is None:
+        return []
+    if not isinstance(raw_history, list):
+        raise HTTPException(400, "history must be an array")
+
+    history: list[dict[str, str]] = []
+    for item in raw_history:
+        if not isinstance(item, dict):
+            continue
+        raw_role = item.get("role")
+        raw_text = item.get("text")
+        if not isinstance(raw_role, str) or not isinstance(raw_text, str):
+            continue
+        role = raw_role.strip().lower()
+        text = raw_text.strip()
+        if not text:
+            continue
+        if role == "assistant":
+            role = "tutor"
+        elif role == "user":
+            role = "student"
+        if role not in {"student", "tutor"}:
+            continue
+        history.append({"role": role, "text": text})
+    return history
+
+
+def _generate_tutor_chat_reply_with_gemini(
+    *,
+    student_message: str,
+    history: list[dict[str, str]],
+    context: dict[str, Any],
+    original_script: str,
+) -> tuple[str, str]:
+    gemini_key = _load_secret(
+        ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        legacy_labels=("Gemini", "GEMINI"),
+    )
+    if not gemini_key:
+        raise HTTPException(500, "missing Gemini API key (GEMINI_API_KEY or GOOGLE_API_KEY)")
+
+    system_prompt = (
+        "You are a piano tutor in a live conversation with a student. "
+        "You already gave them initial feedback. Now answer their follow-up question using the "
+        "session data provided. Keep responses spoken-style, directly useful, and substantial enough to sound like "
+        "a real follow-up answer. Aim for 3-5 sentences and about 10-15 seconds when spoken aloud (~30-45 words). "
+        "Do not repeat the original critique verbatim. If the student asks about something not present in the "
+        "data, say so briefly and redirect to what the data does show."
+    )
+    user_prompt = (
+        f"Session context JSON:\n{json.dumps(context, ensure_ascii=True, separators=(',', ':'))}\n\n"
+        f"Original tutor feedback:\n{original_script}\n\n"
+        f"Conversation history JSON:\n{json.dumps(history[-6:], ensure_ascii=True, separators=(',', ':'))}\n\n"
+        f"Student question:\n{student_message}"
+    )
+    request_payload = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {
+            "temperature": 0.35,
+            "maxOutputTokens": 320,
+        },
+    }
+
+    model_candidates: list[str] = []
+    preferred_override = os.getenv("GEMINI_MODEL")
+    if preferred_override and preferred_override.strip():
+        model_candidates.append(preferred_override.strip())
+    model_candidates.extend(GEMINI_MODEL_CANDIDATES)
+
+    try:
+        available_models = _list_gemini_generate_models(gemini_key)
+    except Exception:
+        available_models = []
+
+    if available_models:
+        ranked: list[str] = []
+        seen: set[str] = set()
+        for candidate in model_candidates:
+            if candidate in available_models and candidate not in seen:
+                ranked.append(candidate)
+                seen.add(candidate)
+        for available in available_models:
+            if available not in seen:
+                ranked.append(available)
+                seen.add(available)
+        model_candidates = ranked
+    else:
+        deduped: list[str] = []
+        seen_local: set[str] = set()
+        for candidate in model_candidates:
+            if candidate in seen_local:
+                continue
+            seen_local.add(candidate)
+            deduped.append(candidate)
+        model_candidates = deduped
+
+    encoded_key = url_quote(gemini_key, safe="")
+
+    def _generate_for_model(model: str, payload: dict[str, Any]) -> str:
+        model_path = url_quote(model, safe="")
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_path}:generateContent?key={encoded_key}"
+        )
+        encoded_payload = json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        with urlopen(
+            UrlRequest(
+                url=url,
+                data=encoded_payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            ),
+            timeout=40,
+        ) as response:
+            payload_data = json.loads(response.read().decode("utf-8"))
+        return _extract_gemini_text(payload_data).strip().strip('"')
+
+    errors: list[str] = []
+    for model in model_candidates:
+        try:
+            reply = _generate_for_model(model, request_payload)
+            if not reply:
+                errors.append(f"{model}: empty response")
+                continue
+
+            word_count = _count_words(reply)
+            if word_count >= MIN_TUTOR_CHAT_WORDS and _estimate_tutor_seconds(reply) >= MIN_TUTOR_CHAT_SECONDS:
+                return reply, model
+
+            retry_prompt = (
+                "Your previous follow-up reply was too short for spoken playback.\n"
+                f"Previous reply ({word_count} words): {reply}\n\n"
+                "Answer the same student question again using the same session context.\n"
+                f"The new reply must be at least {MIN_TUTOR_CHAT_WORDS} words and should sound like 10-15 seconds of speech.\n"
+                "Stay natural, specific, and spoken-style. Do not add markdown or bullet points."
+            )
+            retry_payload = {
+                "systemInstruction": request_payload["systemInstruction"],
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "text": (
+                                    f"{user_prompt}\n\n"
+                                    f"{retry_prompt}"
+                                )
+                            }
+                        ],
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.35,
+                    "maxOutputTokens": 380,
+                },
+            }
+            retry_reply = _generate_for_model(model, retry_payload)
+            retry_word_count = _count_words(retry_reply)
+            if retry_reply and retry_word_count >= MIN_TUTOR_CHAT_WORDS and _estimate_tutor_seconds(retry_reply) >= MIN_TUTOR_CHAT_SECONDS:
+                return retry_reply, model
+            errors.append(
+                f"{model}: reply too short ({word_count} words, retry {retry_word_count} words)"
+            )
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            errors.append(f"{model}: HTTP {exc.code} {body[:180]}")
+        except URLError as exc:
+            errors.append(f"{model}: {exc.reason}")
+        except HTTPException as exc:
+            errors.append(f"{model}: {exc.detail}")
+        except Exception as exc:
+            errors.append(f"{model}: {exc}")
+
+    raise HTTPException(502, f"Gemini chat generation failed: {' | '.join(errors)}")
+
+
+def _synthesize_tutor_chat_audio(
+    script: str,
+    *,
+    sdir: Path,
+    turn_index: int,
+    voice_id: str | None = None,
+) -> tuple[str, Path]:
+    elevenlabs_key = _load_secret(
+        ("ELEVENLABS_API_KEY",),
+        legacy_labels=("ElevenLabs", "ELEVENLABS"),
+    )
+    if not elevenlabs_key:
+        raise HTTPException(500, "missing ElevenLabs API key (ELEVENLABS_API_KEY)")
+
+    voice_id = voice_id or os.getenv("ELEVENLABS_VOICE_ID") or _load_secret(("ELEVENLABS_VOICE_ID",)) or DEFAULT_TUTOR_VOICE_ID
+    model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
+    audio_path = sdir / f"chat_audio_{max(0, turn_index)}.mp3"
+
+    try:
+        client = ElevenLabs(api_key=elevenlabs_key)
+        audio_stream = client.text_to_speech.convert(
+            voice_id=voice_id,
+            text=script,
+            output_format="mp3_44100_128",
+            model_id=model_id,
+        )
+        audio_bytes = b"".join(audio_stream)
+    except Exception as exc:
+        raise HTTPException(502, f"ElevenLabs text-to-speech failed: {exc}") from exc
+
+    if not audio_bytes:
+        raise HTTPException(502, "ElevenLabs text-to-speech returned empty audio")
+
+    audio_path.write_bytes(audio_bytes)
+    return voice_id, audio_path
+
+
 def _beats_per_measure(pm: pretty_midi.PrettyMIDI) -> int:
     if pm.time_signature_changes:
         return pm.time_signature_changes[0].numerator
@@ -1323,7 +1810,6 @@ def _compute_tempo_map(
     ms_per_beat = 60000.0 / tempo_bpm
     ms_per_measure = ms_per_beat * beats_per_measure
 
-    # Build list of (ref_onset_ms, played_onset_ms) for all matched notes
     matched_pairs: list[tuple[float, float]] = []
     for ann in annotated_reference_notes:
         if ann["playedIdx"] is not None:
@@ -1358,8 +1844,6 @@ def _compute_tempo_map(
                 ref_interval = r1 - r0
                 played_interval = p1 - p0
                 if ref_interval > 10:
-                    # scale > 1 means player took longer (dragging)
-                    # deviationPct: positive = rushed, negative = dragged
                     scale = played_interval / ref_interval
                     scales.append((1.0 - scale) * 100.0)
             if scales:
@@ -1377,6 +1861,327 @@ def _compute_tempo_map(
         })
 
     return result
+
+
+def _measure_window_ms(*, bpm: float, beats_per_measure: int) -> tuple[float, float]:
+    ms_per_beat = 60000.0 / max(1e-6, bpm)
+    return ms_per_beat, ms_per_beat * beats_per_measure
+
+
+def _identify_trouble_measures(
+    annotated_notes: list[dict[str, Any]],
+    bpm: float,
+    beats_per_measure: int,
+) -> list[dict[str, int]]:
+    if not annotated_notes or bpm <= 0:
+        return []
+
+    _, ms_per_measure = _measure_window_ms(bpm=bpm, beats_per_measure=beats_per_measure)
+    buckets: dict[int, dict[str, int]] = {}
+
+    for note in annotated_notes:
+        onset_ms = int(note.get("onset_ms", 0))
+        measure_number = int(onset_ms // ms_per_measure) + 1
+        bucket = buckets.setdefault(
+            measure_number,
+            {
+                "measureNumber": measure_number,
+                "score": 0,
+                "startMs": int(round((measure_number - 1) * ms_per_measure)),
+                "endMs": int(round(measure_number * ms_per_measure)),
+                "noteCount": 0,
+            },
+        )
+        bucket["noteCount"] += 1
+
+        status = note.get("status")
+        if status == "wrongPitch":
+            bucket["score"] += 2
+        elif status == "missed":
+            bucket["score"] += 2
+
+        timing_status = note.get("timingStatus")
+        if timing_status in {"early", "late"}:
+            bucket["score"] += 1
+
+    ranked = sorted(
+        buckets.values(),
+        key=lambda item: (-item["score"], item["measureNumber"]),
+    )
+    non_zero = [item for item in ranked if item["score"] > 0]
+    selected = non_zero[:DRILL_MAX_MEASURES] if non_zero else ranked[:1]
+    return [
+        {
+            "measureNumber": int(item["measureNumber"]),
+            "score": int(item["score"]),
+            "startMs": int(item["startMs"]),
+            "endMs": int(item["endMs"]),
+        }
+        for item in selected
+    ]
+
+
+def _build_excerpt_midi(
+    reference_notes: list[dict[str, int]],
+    trouble_measures: list[dict[str, int]],
+    *,
+    bpm: float,
+    beats_per_measure: int,
+    sdir: Path,
+) -> Path:
+    if not reference_notes:
+        raise HTTPException(400, "missing reference notes for drill excerpt")
+    if not trouble_measures:
+        raise HTTPException(400, "missing trouble measures for drill excerpt")
+    if bpm <= 0:
+        raise HTTPException(400, "invalid tempo for drill excerpt")
+
+    ms_per_beat, _ = _measure_window_ms(bpm=bpm, beats_per_measure=beats_per_measure)
+    first_measure_start = min(int(m["startMs"]) for m in trouble_measures)
+    last_measure_end = max(int(m["endMs"]) for m in trouble_measures)
+    excerpt_start_ms = max(0, int(round(first_measure_start - ms_per_beat)))
+    excerpt_end_ms = int(last_measure_end)
+
+    excerpt_notes = [
+        note for note in reference_notes
+        if excerpt_start_ms <= int(note["onset_ms"]) < excerpt_end_ms
+    ]
+    if not excerpt_notes:
+        excerpt_notes = [
+            note for note in reference_notes
+            if first_measure_start <= int(note["onset_ms"]) < excerpt_end_ms
+        ]
+    if not excerpt_notes:
+        raise HTTPException(400, "reference notes do not overlap the selected drill measures")
+
+    practice_bpm = max(20.0, float(bpm) * DRILL_PRACTICE_TEMPO_RATIO)
+    beat_seconds = 60.0 / practice_bpm
+    count_in_seconds = beat_seconds * beats_per_measure
+    pm = pretty_midi.PrettyMIDI(initial_tempo=practice_bpm)
+
+    click = pretty_midi.Instrument(program=0, is_drum=True, name="Count In")
+    click_length = min(0.12, beat_seconds * 0.45)
+    for beat_idx in range(beats_per_measure):
+        start = beat_idx * beat_seconds
+        click.notes.append(
+            pretty_midi.Note(
+                velocity=DRILL_COUNT_IN_VELOCITY,
+                pitch=DRILL_COUNT_IN_PITCH,
+                start=start,
+                end=start + click_length,
+            )
+        )
+
+    piano = pretty_midi.Instrument(
+        program=pretty_midi.instrument_name_to_program("Acoustic Grand Piano"),
+        name="Drill Excerpt",
+    )
+    for note in excerpt_notes:
+        rel_start_seconds = (int(note["onset_ms"]) - excerpt_start_ms) / 1000.0
+        start = count_in_seconds + max(0.0, rel_start_seconds)
+        duration = max(0.05, int(note["duration_ms"]) / 1000.0)
+        piano.notes.append(
+            pretty_midi.Note(
+                velocity=max(1, min(127, int(note.get("velocity", 80)))),
+                pitch=max(0, min(127, int(note["pitch"]))),
+                start=start,
+                end=start + duration,
+            )
+        )
+
+    pm.instruments.extend([click, piano])
+    midi_path = sdir / "drill_excerpt.mid"
+    pm.write(str(midi_path))
+    return midi_path
+
+
+def _top_error_type(notes: list[dict[str, Any]]) -> str:
+    counts = {"wrong_pitch": 0, "missed": 0, "timing": 0}
+    for note in notes:
+        status = note.get("status")
+        if status == "wrongPitch":
+            counts["wrong_pitch"] += 1
+        elif status == "missed":
+            counts["missed"] += 1
+        timing_status = note.get("timingStatus")
+        if timing_status in {"early", "late"}:
+            counts["timing"] += 1
+    return max(counts.items(), key=lambda item: (item[1], item[0] == "timing"))[0]
+
+
+def _strip_code_fences(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
+
+
+def _generate_musicxml_with_gemini(system_prompt: str, user_prompt: str) -> tuple[str, str]:
+    gemini_key = _load_secret(
+        ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        legacy_labels=("Gemini", "GEMINI"),
+    )
+    if not gemini_key:
+        raise HTTPException(500, "missing Gemini API key (GEMINI_API_KEY or GOOGLE_API_KEY)")
+
+    model_candidates: list[str] = []
+    preferred_override = os.getenv("GEMINI_MODEL")
+    if preferred_override and preferred_override.strip():
+        model_candidates.append(preferred_override.strip())
+    model_candidates.extend(GEMINI_MODEL_CANDIDATES)
+
+    try:
+        available_models = _list_gemini_generate_models(gemini_key)
+    except Exception:
+        available_models = []
+
+    if available_models:
+        ranked: list[str] = []
+        seen: set[str] = set()
+        for candidate in model_candidates:
+            if candidate in available_models and candidate not in seen:
+                ranked.append(candidate)
+                seen.add(candidate)
+        for available in available_models:
+            if available not in seen:
+                ranked.append(available)
+                seen.add(available)
+        model_candidates = ranked
+    else:
+        deduped: list[str] = []
+        seen_local: set[str] = set()
+        for candidate in model_candidates:
+            if candidate in seen_local:
+                continue
+            seen_local.add(candidate)
+            deduped.append(candidate)
+        model_candidates = deduped
+
+    encoded_key = url_quote(gemini_key, safe="")
+    request_payload = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {
+            "temperature": 0.25,
+            "maxOutputTokens": 2200,
+        },
+    }
+
+    errors: list[str] = []
+    for model in model_candidates:
+        try:
+            model_path = url_quote(model, safe="")
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model_path}:generateContent?key={encoded_key}"
+            )
+            encoded_payload = json.dumps(
+                request_payload,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            with urlopen(
+                UrlRequest(
+                    url=url,
+                    data=encoded_payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                ),
+                timeout=40,
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            return _strip_code_fences(_extract_gemini_text(payload)), model
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            errors.append(f"{model}: HTTP {exc.code} {body[:180]}")
+        except URLError as exc:
+            errors.append(f"{model}: {exc.reason}")
+        except HTTPException as exc:
+            errors.append(f"{model}: {exc.detail}")
+        except Exception as exc:
+            errors.append(f"{model}: {exc}")
+
+    raise HTTPException(502, f"Gemini generation failed: {' | '.join(errors)}")
+
+
+def _build_ai_drill_description(
+    *,
+    top_error_type: str,
+    measure_numbers: list[int],
+    practice_bpm: int,
+) -> str:
+    measures_label = ", ".join(str(n) for n in measure_numbers)
+    if top_error_type == "wrong_pitch":
+        opening = "A slow pitch-accuracy drill isolating the notes you misread"
+    elif top_error_type == "missed":
+        opening = "A simplified recovery drill for the notes you dropped"
+    else:
+        opening = "A rhythmic skeleton drill to steady the trouble passage"
+    return f"{opening} in measures {measures_label}, at {practice_bpm} BPM."
+
+
+def _build_ai_drill_midi(
+    trouble_notes: list[dict[str, Any]],
+    *,
+    bpm: float,
+    piece_name: str,
+    measure_numbers: list[int],
+    sdir: Path,
+) -> tuple[Path | None, str | None]:
+    if not trouble_notes or bpm <= 0:
+        return None, None
+
+    practice_bpm = max(20, int(round(float(bpm) * DRILL_PRACTICE_TEMPO_RATIO)))
+    top_error_type = _top_error_type(trouble_notes)
+    note_payload = [
+        {
+            "pitch": int(note["pitch"]),
+            "onset_ms": int(note["onset_ms"]),
+            "duration_ms": int(note["duration_ms"]),
+            "status": note.get("status"),
+            "timingStatus": note.get("timingStatus"),
+        }
+        for note in trouble_notes[:24]
+    ]
+    system_prompt = (
+        "You are a piano pedagogy expert. Generate a concise piano exercise targeting the "
+        "student's specific weakness. Output valid MusicXML only with no markdown, prose, or "
+        "explanation. The exercise must be 4 to 8 bars, include a tempo marking at "
+        f"{practice_bpm} BPM, use treble and bass clef, and be technically simpler than the "
+        "original passage while isolating the same interval or rhythm pattern."
+    )
+    user_prompt = (
+        f"Piece: {piece_name}\n"
+        f"Reference tempo: {bpm:.2f} BPM\n"
+        f"Practice tempo: {practice_bpm} BPM\n"
+        f"Top error type: {top_error_type}\n"
+        f"Measure numbers: {measure_numbers}\n"
+        f"Problem notes JSON: {json.dumps(note_payload, ensure_ascii=True)}"
+    )
+
+    try:
+        xml_text, model = _generate_musicxml_with_gemini(system_prompt, user_prompt)
+        score = converter.parseData(xml_text, format="musicxml")
+        midi_file = m21midi.translate.streamToMidiFile(score)
+        midi_path = sdir / "drill_ai.mid"
+        midi_file.open(str(midi_path), "wb")
+        midi_file.write()
+        midi_file.close()
+        description = _build_ai_drill_description(
+            top_error_type=top_error_type,
+            measure_numbers=measure_numbers,
+            practice_bpm=practice_bpm,
+        )
+        print(f"[drill] AI drill generated with Gemini model {model}")
+        return midi_path, description
+    except Exception as exc:
+        print(f"[drill] AI drill generation skipped: {exc}")
+        return None, None
 
 
 def _dtw_align_notes(
@@ -1410,6 +2215,7 @@ def _dtw_align_notes(
                 "pitchDelta": None,
                 "dynamicDelta": None,
                 "dynamicLabel": None,
+                "dynamicInfo": None,
             }
             for idx, ref_note in enumerate(reference_notes)
         ]
@@ -1423,6 +2229,7 @@ def _dtw_align_notes(
                 "pitchDelta": None,
                 "dynamicDelta": None,
                 "dynamicLabel": None,
+                "dynamicInfo": None,
             }
             for idx in range(n)
         ]
@@ -1512,6 +2319,7 @@ def _dtw_align_notes(
                     "pitchDelta": pitch_delta,
                     "dynamicDelta": dynamic_delta,
                     "dynamicLabel": _dynamic_label(dynamic_delta),
+                    "dynamicInfo": _dynamic_info(ref_note["velocity"], played_note["velocity"]),
                 }
                 alignment.append(row)
                 ref_annotations[ref_idx] = row
@@ -1530,6 +2338,7 @@ def _dtw_align_notes(
                     "pitchDelta": None,
                     "dynamicDelta": None,
                     "dynamicLabel": None,
+                    "dynamicInfo": None,
                 }
                 missed_count += 1
                 alignment.append(row)
@@ -1549,6 +2358,7 @@ def _dtw_align_notes(
                     "pitchDelta": None,
                     "dynamicDelta": None,
                     "dynamicLabel": None,
+                    "dynamicInfo": None,
                 }
                 extra_count += 1
                 alignment.append(row)
@@ -1570,6 +2380,7 @@ def _dtw_align_notes(
             "pitchDelta": None,
             "dynamicDelta": None,
             "dynamicLabel": None,
+            "dynamicInfo": None,
         }
         missed_count += 1
         alignment.append(row)
@@ -1630,6 +2441,7 @@ def _dtw_align_notes(
                 "pitchDelta": ann["pitchDelta"],
                 "dynamicDelta": ann.get("dynamicDelta"),
                 "dynamicLabel": ann.get("dynamicLabel"),
+                "dynamicInfo": ann.get("dynamicInfo"),
             }
         )
 
@@ -1706,7 +2518,6 @@ async def upload_midi(file: UploadFile = File(...)) -> dict:
         score.write("musicxml", fp=str(xml_path))
         musicxml_text = xml_path.read_text(encoding="utf-8")
     except Exception as e:
-        # MusicXML rendering is non-fatal — alignment only needs the note list.
         print(f"[midi] MusicXML conversion failed: {e}")
 
     tempo_bpm: float | None = None
@@ -1716,12 +2527,14 @@ async def upload_midi(file: UploadFile = File(...)) -> dict:
         pass
 
     reference_audio_path, reference_audio_renderer = _synthesize_reference_audio(pm, sdir=sdir)
+    is_piano_only = _is_piano_only_midi(pm)
 
     return {
         "sessionId": session_id,
         "referenceNotes": reference_notes,
         "musicxml": musicxml_text,
         "tempoBpm": tempo_bpm,
+        "isPianoOnly": is_piano_only,
         "durationMs": int(pm.get_end_time() * 1000),
         "noteCount": len(reference_notes),
         "referenceAudioPath": (
@@ -1882,7 +2695,6 @@ async def align(request: Request) -> dict:
 
     alignment, annotated_reference_notes, extra_played_notes, summary = _dtw_align_notes(reference_notes, played_notes)
 
-    # Compute per-measure tempo map
     tempo_map: list[dict] = []
     midi_path = sdir / "reference.mid"
     if midi_path.exists():
@@ -2213,7 +3025,7 @@ def get_session_media(session_id: str, filename: str) -> FileResponse:
     media_path = _resolve_session_media_path(
         sdir,
         filename,
-        allowed_suffixes={".mp3", ".wav", ".mov", ".mp4", ".m4v", ".webm", ".mkv"},
+        allowed_suffixes={".mp3", ".mid", ".midi", ".wav", ".mov", ".mp4", ".m4v", ".webm", ".mkv"},
     )
     media_type = _media_type_for_suffix(media_path.suffix.lower())
     return FileResponse(str(media_path), media_type=media_type, filename=filename)
@@ -2258,7 +3070,7 @@ async def tutor(request: Request) -> dict:
         played_notes,
         alignment_payload,
         posture_payload,
-        piece_name="Mariage d'Amour (mariage_15s excerpt)",
+        piece_name=_piece_name_for_session(sdir),
     )
     tutor_script, written_note, gemini_model, strengths = _generate_tutor_script_with_gemini(diff_payload)
     tutor_word_count = _count_words(tutor_script)
@@ -2286,3 +3098,150 @@ async def tutor(request: Request) -> dict:
     )
 
     return tutor_payload
+
+
+@app.post("/tutor/chat")
+async def tutor_chat(request: Request) -> dict:
+    content_type = request.headers.get("content-type", "").lower()
+    if "application/json" not in content_type:
+        raise HTTPException(400, "expected application/json body")
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "invalid request body")
+
+    raw_session_id = body.get("sessionId") or body.get("session_id")
+    if not isinstance(raw_session_id, str) or not raw_session_id.strip():
+        raise HTTPException(400, "missing sessionId")
+    session_id = raw_session_id.strip()
+
+    raw_message = body.get("message")
+    if not isinstance(raw_message, str) or not raw_message.strip():
+        raise HTTPException(400, "missing message")
+    student_message = raw_message.strip()
+
+    history = _coerce_chat_history(body.get("history"))
+    sdir = _session_dir(session_id)
+    session_context = _load_session_context(sdir)
+    compact_context = _trim_context_for_chat(session_context, history)
+    original_script = session_context["originalFeedback"]["tutorScript"]
+    reply, gemini_model = _generate_tutor_chat_reply_with_gemini(
+        student_message=student_message,
+        history=history,
+        context=compact_context,
+        original_script=original_script,
+    )
+
+    audio_url: str | None = None
+    voice_payload = session_context.get("voice")
+    voice_id = None
+    if isinstance(voice_payload, dict):
+        maybe_voice_id = voice_payload.get("voiceId")
+        if isinstance(maybe_voice_id, str) and maybe_voice_id.strip():
+            voice_id = maybe_voice_id.strip()
+    try:
+        voice_id, audio_path = _synthesize_tutor_chat_audio(
+            reply,
+            sdir=sdir,
+            turn_index=len(history),
+            voice_id=voice_id,
+        )
+        audio_url = f"/audio/{session_id}/{audio_path.name}"
+    except HTTPException:
+        audio_url = None
+
+    return {
+        "sessionId": session_id,
+        "reply": reply,
+        "audioUrl": audio_url,
+        "model": {"provider": "gemini", "model": gemini_model},
+        "voice": {"voiceId": voice_id or DEFAULT_TUTOR_VOICE_ID},
+    }
+
+
+@app.post("/drill")
+async def drill(request: Request) -> dict:
+    session_id = await _read_session_id(request)
+    content_type = request.headers.get("content-type", "").lower()
+    raw_type: Any = None
+    if "application/json" in content_type:
+        body = await request.json()
+        if isinstance(body, dict):
+            raw_type = body.get("type")
+    else:
+        form = await request.form()
+        raw_type = form.get("type")
+
+    drill_type = raw_type.strip() if isinstance(raw_type, str) and raw_type.strip() else "both"
+    if drill_type not in {"excerpt", "ai-generated", "both"}:
+        raise HTTPException(400, "type must be excerpt, ai-generated, or both")
+
+    sdir = _session_dir(session_id)
+    reference_notes = _reference_notes_for_session(sdir)
+    alignment_payload = _read_json_dict(
+        sdir / "alignment.json",
+        missing_message="missing alignment for session; run /align first",
+        invalid_message="invalid alignment payload in storage",
+    )
+    annotated_reference_notes = alignment_payload.get("annotatedReferenceNotes")
+    if not isinstance(annotated_reference_notes, list):
+        raise HTTPException(500, "alignment.json missing annotatedReferenceNotes[]")
+
+    midi_path = sdir / "reference.mid"
+    if not midi_path.exists():
+        raise HTTPException(400, "missing reference MIDI for drill generation")
+    try:
+        pm = pretty_midi.PrettyMIDI(str(midi_path))
+        if not _is_piano_only_midi(pm):
+            raise HTTPException(400, "drill generation is only available for piano reference MIDI")
+        bpm = float(pm.estimate_tempo())
+        beats_per_measure = _beats_per_measure(pm)
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            raise exc
+        raise HTTPException(500, f"failed to load reference tempo for drill generation: {exc}") from exc
+
+    trouble_measures = _identify_trouble_measures(
+        annotated_reference_notes,
+        bpm=bpm,
+        beats_per_measure=beats_per_measure,
+    )
+    if not trouble_measures:
+        raise HTTPException(400, "could not derive drill measures from alignment")
+
+    measure_numbers = [int(item["measureNumber"]) for item in trouble_measures]
+    excerpt_path: Path | None = None
+    ai_path: Path | None = None
+    ai_description: str | None = None
+
+    if drill_type in {"excerpt", "both"}:
+        excerpt_path = _build_excerpt_midi(
+            reference_notes,
+            trouble_measures,
+            bpm=bpm,
+            beats_per_measure=beats_per_measure,
+            sdir=sdir,
+        )
+
+    if drill_type in {"ai-generated", "both"}:
+        trouble_measure_set = set(measure_numbers)
+        trouble_notes = [
+            note for note in annotated_reference_notes
+            if int(
+                int(note.get("onset_ms", 0)) // _measure_window_ms(bpm=bpm, beats_per_measure=beats_per_measure)[1]
+            ) + 1 in trouble_measure_set
+        ]
+        ai_path, ai_description = _build_ai_drill_midi(
+            trouble_notes,
+            bpm=bpm,
+            piece_name=_piece_name_for_session(sdir),
+            measure_numbers=measure_numbers,
+            sdir=sdir,
+        )
+
+    return {
+        "sessionId": session_id,
+        "excerptMidiUrl": f"/media/{session_id}/{excerpt_path.name}" if excerpt_path is not None else None,
+        "aiDrillMidiUrl": f"/media/{session_id}/{ai_path.name}" if ai_path is not None else None,
+        "aiDrillDescription": ai_description,
+    }
