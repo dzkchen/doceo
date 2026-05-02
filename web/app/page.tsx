@@ -205,6 +205,8 @@ type TutorResponse = {
   piece: string;
   diff: TutorDiff;
   tutorScript: string;
+  writtenNote: string | null;
+  strengths: string[];
   audioPath: string;
   audioUrl: string;
   model: {
@@ -214,6 +216,13 @@ type TutorResponse = {
   voice: {
     voiceId: string;
   };
+};
+
+type FocusArea = {
+  bucket: string;
+  color: string;
+  summary: string;
+  drill: string;
 };
 
 function resolveApiUrl(path: string): string {
@@ -231,6 +240,70 @@ function dynamicTooltip(note: AnnotatedReferenceNote): string | null {
   if (!hasDynamicOutlier(note)) return null;
   const label = note.dynamicLabel ?? (note.dynamicDelta! > 0 ? "much louder than written" : "much softer than written");
   return `${label} (${note.dynamicDelta! > 0 ? "+" : ""}${note.dynamicDelta})`;
+}
+
+function computeFocusAreas(
+  alignment: AlignResponse,
+  pose: PoseResponse | null,
+  dynamicsOutlierCount: number,
+): FocusArea[] {
+  const s = alignment.summary;
+  const areas: FocusArea[] = [];
+
+  if (s.wrongPitch + s.missed > 0) {
+    areas.push({
+      bucket: "Note Accuracy",
+      color: "#2563eb",
+      summary: `${s.wrongPitch} wrong-pitch and ${s.missed} missed notes`,
+      drill: `${s.wrongPitch} wrong-pitch and ${s.missed} missed notes detected. Mark those passages in the score, then play through at 40% tempo — hands separately — until each one is clean.`,
+    });
+  }
+
+  if (areas.length < 3 && s.early + s.late > 0) {
+    areas.push({
+      bucket: "Timing",
+      color: "#d97706",
+      summary: `${s.early} early and ${s.late} late notes (±${s.timingThresholdMs}ms window)`,
+      drill: `${s.early} early and ${s.late} late notes (±${s.timingThresholdMs}ms window). Set a metronome to 60% of the target tempo and focus on landing each note exactly on the click.`,
+    });
+  }
+
+  if (areas.length < 3 && dynamicsOutlierCount > 0) {
+    areas.push({
+      bucket: "Dynamics",
+      color: "#ea580c",
+      summary: `${dynamicsOutlierCount} notes played significantly louder or softer than written`,
+      drill: `${dynamicsOutlierCount} notes played significantly louder or softer than written. Compare your performance against the reference audio using A/B playback, then replay the passage focusing on matching written velocity.`,
+    });
+  }
+
+  if (areas.length < 3 && pose && pose.postureSummary.flagCount > 0) {
+    const byType = pose.postureSummary.byType;
+    const topEntry = Object.entries(byType).sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0))[0];
+    const topIssueType = topEntry ? prettyRuleName(topEntry[0] as PostureRule) : "posture";
+    const flagCount = pose.postureSummary.flagCount;
+    areas.push({
+      bucket: "Posture",
+      color: "#7c3aed",
+      summary: `${flagCount} posture flags (${topIssueType} most prominent)`,
+      drill: `${flagCount} posture flags detected (${topIssueType} most prominent). Between run-throughs, reset your position: feet flat, back straight, wrists level before each take.`,
+    });
+  }
+
+  if (
+    areas.length < 3 &&
+    s.tempoDeviationPct !== null &&
+    Math.abs(s.tempoDeviationPct) > 10
+  ) {
+    areas.push({
+      bucket: "Tempo",
+      color: "#059669",
+      summary: `Overall tempo drifted ${s.tempoDeviationPct.toFixed(1)}% from the reference`,
+      drill: `Overall tempo drifted ${s.tempoDeviationPct.toFixed(1)}% from the reference. Run the piece with a metronome locked to the target BPM, counting out loud to anchor the beat.`,
+    });
+  }
+
+  return areas;
 }
 
 export default function Home() {
@@ -396,6 +469,11 @@ export default function Home() {
     return Math.max(1, midiDuration, playedDuration, postureDuration);
   }, [midi?.durationMs, playedNotes, pose?.postureTimeline]);
 
+  const focusAreas = useMemo(
+    () => (alignment ? computeFocusAreas(alignment, pose, dynamicsOutlierCount) : []),
+    [alignment, pose, dynamicsOutlierCount],
+  );
+
   return (
     <main className="mx-auto max-w-5xl space-y-6 p-8 font-sans">
       <header>
@@ -558,7 +636,7 @@ export default function Home() {
           </div>
         )}
         {alignment && (
-          <div className="mt-3 space-y-2 rounded border border-zinc-200 p-3 dark:border-zinc-800">
+          <div className="mt-3">
             <button
               disabled={busy !== null}
               className="rounded bg-zinc-900 px-3 py-2 text-sm text-white disabled:cursor-not-allowed disabled:opacity-30 dark:bg-zinc-100 dark:text-zinc-900"
@@ -570,18 +648,57 @@ export default function Home() {
                   ? "Regenerate tutor feedback"
                   : "Play tutor feedback"}
             </button>
-            {tutor && (
-              <>
-                <p className="text-sm text-zinc-600">
-                  Voice tutor ({tutor.model.provider} / {tutor.model.model}) ready.
-                </p>
-                <audio controls preload="metadata" src={resolveApiUrl(tutor.audioUrl)} className="w-full" />
-                <p className="text-sm text-zinc-700">{tutor.tutorScript}</p>
-              </>
-            )}
           </div>
         )}
       </section>
+
+      {alignment && (
+        <TutorReportCard
+          tutor={tutor}
+          alignment={alignment}
+          busy={busy === "tutor"}
+          onGenerate={generateTutorFeedback}
+          resolveUrl={resolveApiUrl}
+        />
+      )}
+
+      {focusAreas.length > 0 && (
+        <>
+          <section>
+            <h2 className="mb-3 text-xl font-semibold">Focus Areas</h2>
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+              {focusAreas.map((area) => (
+                <div
+                  key={area.bucket}
+                  className="rounded border border-zinc-200 p-3 pl-4 dark:border-zinc-800"
+                  style={{ borderLeftColor: area.color, borderLeftWidth: 4 }}
+                >
+                  <p className="text-sm font-semibold text-zinc-800 dark:text-zinc-100">{area.bucket}</p>
+                  <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">{area.summary}</p>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section>
+            <h2 className="mb-3 text-xl font-semibold">Today&apos;s Drills</h2>
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+              {focusAreas.map((area, idx) => (
+                <div
+                  key={area.bucket}
+                  className="rounded border border-zinc-200 p-3 pl-4 dark:border-zinc-800"
+                  style={{ borderLeftColor: area.color, borderLeftWidth: 4 }}
+                >
+                  <p className="text-sm font-semibold text-zinc-800 dark:text-zinc-100">
+                    Drill {idx + 1}
+                  </p>
+                  <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">{area.drill}</p>
+                </div>
+              ))}
+            </div>
+          </section>
+        </>
+      )}
 
       <section>
         <div className="mb-2 flex items-center justify-between gap-3">
@@ -632,6 +749,9 @@ export default function Home() {
           />
         )}
       </section>
+      {alignment && (
+        <MarginaliaSection alignment={alignment} playedNotes={playedNotes} />
+      )}
     </main>
   );
 }
@@ -896,6 +1016,102 @@ function bindScoreScrubClicks(
   }
 }
 
+const FLAT_NOTE_NAMES = ["c", "db", "d", "eb", "e", "f", "gb", "g", "ab", "a", "bb", "b"];
+
+function midiToNoteName(pitch: number): string {
+  const octave = Math.floor(pitch / 12) - 1;
+  const name = FLAT_NOTE_NAMES[pitch % 12];
+  return `${name}${octave}`;
+}
+
+type MarginaliaEntry = {
+  timeMs: number;
+  text: string;
+};
+
+function buildMarginalia(
+  alignment: AlignResponse,
+  playedNotes: PlayedNote[] | null,
+): MarginaliaEntry[] {
+  const entries: MarginaliaEntry[] = [];
+
+  for (const note of alignment.annotatedReferenceNotes) {
+    const timeSec = (note.onset_ms / 1000).toFixed(1);
+
+    if (note.status === "wrongPitch") {
+      const expectedName = midiToNoteName(note.pitch);
+      const playedNote =
+        playedNotes && note.playedIdx !== null ? playedNotes[note.playedIdx] : null;
+      const playedName = playedNote ? midiToNoteName(playedNote.pitch) : "?";
+      entries.push({
+        timeMs: note.onset_ms,
+        text: `${timeSec}s  wrong pitch  played ${playedName}  expected ${expectedName}`,
+      });
+    } else if (note.status === "missed") {
+      const expectedName = midiToNoteName(note.pitch);
+      entries.push({
+        timeMs: note.onset_ms,
+        text: `${timeSec}s  missed  ${expectedName}`,
+      });
+    } else if (note.status === "extra") {
+      const playedNote =
+        playedNotes && note.playedIdx !== null ? playedNotes[note.playedIdx] : null;
+      const noteName = playedNote ? `  ${midiToNoteName(playedNote.pitch)}` : "";
+      entries.push({
+        timeMs: note.onset_ms,
+        text: `${timeSec}s  extra note${noteName}`,
+      });
+    }
+
+    if (hasDynamicOutlier(note)) {
+      const delta = note.dynamicDelta!;
+      const label = note.dynamicLabel ?? (delta > 0 ? "too forceful" : "too soft");
+      const sign = delta > 0 ? "+" : "";
+      entries.push({
+        timeMs: note.onset_ms,
+        text: `${timeSec}s  dynamics  ${label} (Δ ${sign}${delta})`,
+      });
+    }
+  }
+
+  return entries.sort((a, b) => a.timeMs - b.timeMs);
+}
+
+function MarginaliaSection({
+  alignment,
+  playedNotes,
+}: {
+  alignment: AlignResponse;
+  playedNotes: PlayedNote[] | null;
+}) {
+  const entries = useMemo(
+    () => buildMarginalia(alignment, playedNotes),
+    [alignment, playedNotes],
+  );
+
+  if (entries.length === 0) {
+    return (
+      <section>
+        <h2 className="mb-3 text-xl font-semibold">Marginalia</h2>
+        <p className="text-sm text-zinc-400">No errors detected.</p>
+      </section>
+    );
+  }
+
+  return (
+    <section>
+      <h2 className="mb-3 text-xl font-semibold">Marginalia</h2>
+      <ol className="space-y-1 rounded border border-zinc-200 bg-white p-4 font-mono text-sm dark:border-zinc-800 dark:bg-zinc-950">
+        {entries.map((entry, idx) => (
+          <li key={idx} className="text-zinc-700 dark:text-zinc-300">
+            {entry.text}
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
 function postureSeverityOpacity(severity: PostureSeverity): number {
   if (severity === "severe") return 0.95;
   if (severity === "moderate") return 0.75;
@@ -1147,6 +1363,171 @@ function PostureTimeline({
         <p className="mt-2 text-xs text-zinc-500">No posture flags detected for this take.</p>
       )}
     </div>
+  );
+}
+
+
+function estimatePracticeMinutes(summary: AlignmentSummary): number {
+  const errorCount = summary.wrongPitch + summary.missed;
+  if (errorCount === 0) return 5;
+  return Math.max(5, Math.round(errorCount * 0.38));
+}
+
+function StackedBar({ segments }: { segments: { value: number; color: string; label: string }[] }) {
+  const total = segments.reduce((sum, s) => sum + s.value, 0);
+  if (total === 0) return <div className="h-3 w-full rounded bg-zinc-200" />;
+  return (
+    <div className="flex h-3 w-full overflow-hidden rounded">
+      {segments.map((s) => {
+        if (s.value === 0) return null;
+        return (
+          <div
+            key={s.label}
+            style={{ width: `${(s.value / total) * 100}%`, background: s.color }}
+            title={`${s.label}: ${s.value}`}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function AlignmentPanel({ summary }: { summary: AlignmentSummary }) {
+  const alignSegments = [
+    { value: summary.correct, color: "#166534", label: "Correct" },
+    { value: summary.wrongPitch, color: "#dc2626", label: "Wrong pitch" },
+    { value: summary.missed, color: "#9ca3af", label: "Missed" },
+    { value: summary.extra, color: "#64748b", label: "Extra" },
+  ];
+  const timingSegments = [
+    { value: summary.early, color: "#166534", label: "Early" },
+    { value: summary.onTime, color: "#16a34a", label: "On time" },
+    { value: summary.late, color: "#dc2626", label: "Late" },
+  ];
+  const tempoText = summary.tempoDeviationPct !== null
+    ? summary.tempoDeviationPct > 0
+      ? `You play ${summary.tempoDeviationPct.toFixed(1)}% behind tempo on average.`
+      : `You play ${Math.abs(summary.tempoDeviationPct).toFixed(1)}% ahead of tempo on average.`
+    : null;
+
+  return (
+    <div className="border-l border-zinc-200 p-6 dark:border-zinc-800">
+      <p className="text-xs font-semibold uppercase tracking-widest text-zinc-500">Alignment</p>
+      <div className="mt-3">
+        <StackedBar segments={alignSegments} />
+        <div className="mt-2 space-y-1">
+          {alignSegments.map((s) => (
+            <div key={s.label} className="flex items-center justify-between text-sm">
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 rounded-sm" style={{ background: s.color }} />
+                <span className="text-zinc-600 dark:text-zinc-300">{s.label}</span>
+              </span>
+              <span className="font-medium text-zinc-800 dark:text-zinc-100">{s.value}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <p className="mt-5 text-xs font-semibold uppercase tracking-widest text-zinc-500">
+        Timing (±{summary.timingThresholdMs}ms)
+      </p>
+      <div className="mt-3">
+        <StackedBar segments={timingSegments} />
+        <div className="mt-2 flex justify-between text-sm text-zinc-500">
+          <span>{summary.early} early</span>
+          <span>{summary.onTime} on time</span>
+          <span className={summary.late > 0 ? "font-medium text-red-600" : ""}>{summary.late} late</span>
+        </div>
+        {tempoText && (
+          <p className="mt-2 text-xs italic text-zinc-500">{tempoText}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TutorReportCard({
+  tutor,
+  alignment,
+  busy,
+  onGenerate,
+  resolveUrl,
+}: {
+  tutor: TutorResponse | null;
+  alignment: AlignResponse;
+  busy: boolean;
+  onGenerate: () => void;
+  resolveUrl: (path: string) => string;
+}) {
+  const practiceMinutes = estimatePracticeMinutes(alignment.summary);
+  const errorDomain = alignment.summary.wrongPitch + alignment.summary.missed > 0
+    ? "pitch errors"
+    : alignment.summary.late + alignment.summary.early > 0
+      ? "timing issues"
+      : "remaining issues";
+
+  return (
+    <section className="overflow-hidden rounded border border-zinc-200 dark:border-zinc-800">
+      <div className="grid grid-cols-1 md:grid-cols-[1fr_260px]">
+        <div className="p-6">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold uppercase tracking-widest text-zinc-500">
+              A Patient Note From Your Tutor —
+            </span>
+            <button
+              disabled={busy}
+              onClick={onGenerate}
+              className="flex items-center gap-1.5 rounded border border-zinc-300 px-3 py-1.5 text-sm font-medium text-zinc-700 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"
+            >
+              <span>▶</span>
+              {busy ? "Generating…" : tutor ? "Replay tutor" : "Play tutor"}
+            </button>
+          </div>
+
+          {tutor ? (
+            <>
+              <blockquote className="mt-4 text-xl leading-relaxed text-zinc-800 dark:text-zinc-100">
+                &ldquo;{tutor.writtenNote ?? tutor.tutorScript}&rdquo;
+              </blockquote>
+              <audio
+                key={tutor.audioUrl}
+                autoPlay
+                controls
+                preload="auto"
+                src={resolveUrl(tutor.audioUrl)}
+                className="mt-4 w-full"
+              />
+              <div className="mt-6 grid grid-cols-1 gap-6 sm:grid-cols-2">
+                {tutor.strengths?.length > 0 && (
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-widest text-zinc-500">Strengths</p>
+                    <ul className="mt-2 space-y-1">
+                      {tutor.strengths.map((s, i) => (
+                        <li key={i} className="text-sm italic text-zinc-600 dark:text-zinc-300">
+                          + {s}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-widest text-zinc-500">This Week</p>
+                  <p className="mt-2 text-sm text-zinc-700 dark:text-zinc-300">
+                    Estimated {practiceMinutes} minutes of focused practice should clear most {errorDomain}.
+                  </p>
+                </div>
+              </div>
+            </>
+          ) : (
+            <p className="mt-4 text-sm text-zinc-400">
+              Click &ldquo;Play tutor&rdquo; to generate personalized feedback.
+            </p>
+          )}
+        </div>
+
+        <AlignmentPanel summary={alignment.summary} />
+      </div>
+    </section>
   );
 }
 

@@ -657,6 +657,31 @@ def _build_tutor_diff(
     }
 
 
+def _parse_tutor_json(raw: str) -> tuple[str, str | None, list[str]]:
+    """Extract script, writtenNote, and strengths from a Gemini JSON response. Falls back to raw text."""
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        end = len(lines) - 1 if lines[-1].strip().startswith("```") else len(lines)
+        cleaned = "\n".join(lines[1:end]).strip()
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, dict):
+            script = str(data.get("script", "")).strip()
+            written_note = str(data.get("writtenNote", "")).strip() or None
+            strengths_raw = data.get("strengths", [])
+            strengths = [
+                str(s).strip()
+                for s in (strengths_raw if isinstance(strengths_raw, list) else [])
+                if isinstance(s, str) and str(s).strip()
+            ][:3]
+            if script:
+                return script, written_note, strengths
+    except (json.JSONDecodeError, ValueError, AttributeError):
+        pass
+    return raw.strip(), None, []
+
+
 def _extract_gemini_text(payload: dict[str, Any]) -> str:
     candidates = payload.get("candidates")
     if not isinstance(candidates, list):
@@ -737,7 +762,7 @@ def _list_gemini_generate_models(gemini_key: str) -> list[str]:
     return models
 
 
-def _generate_tutor_script_with_gemini(diff_payload: dict[str, Any]) -> tuple[str, str]:
+def _generate_tutor_script_with_gemini(diff_payload: dict[str, Any]) -> tuple[str, str | None, str, list[str]]:
     gemini_key = _load_secret(
         ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
         legacy_labels=("Gemini", "GEMINI"),
@@ -747,13 +772,30 @@ def _generate_tutor_script_with_gemini(diff_payload: dict[str, Any]) -> tuple[st
 
     system_prompt = (
         "You are a warm, specific piano tutor. "
-        "Write a spoken critique script for one student performance.\n"
-        "Requirements:\n"
+        "Analyze this student's performance and respond with a JSON object only — "
+        "no markdown fences, no prose outside the JSON.\n"
+        "Output exactly this structure (valid JSON, double-quoted strings):\n"
+        "{\"script\": \"<spoken critique>\", "
+        "\"writtenNote\": \"<written note>\", "
+        "\"strengths\": [\"<strength 1>\", \"<strength 2>\", \"<strength 3>\"]}\n"
+        "\nRequirements for script (spoken aloud by voice AI):\n"
         "- 30 to 60 seconds when read aloud (~90-150 words).\n"
         "- Reference at least two concrete moments using timestamps from the provided diff.\n"
-        "- Cover note accuracy and timing. Mention posture if posture flags exist.\n"
+        "- Cover note accuracy and timing. Mention posture only if posture flags exist.\n"
         "- End with exactly one focused practice tip.\n"
-        "- Return plain text only (no markdown, no bullets)."
+        "- Plain text only inside the script string (no markdown, no bullets).\n"
+        "\nRequirements for writtenNote (displayed as a written comment, NOT read aloud):\n"
+        "- 2-3 sentences. Polished, musical prose — the tone of a teacher's written margin note.\n"
+        "- Lead with the overall character of the performance (e.g. expressive, tentative, assured).\n"
+        "- Name the single most important thing to fix this week, in plain musical language.\n"
+        "- Do NOT repeat the script verbatim. Different register: written, not conversational.\n"
+        "- Example style: 'A musical, expressive run-through. Your phrasing is sensitive and the bass "
+        "pulse is steady. The ear and the keys disagree on a few accidentals — that is the chief thing "
+        "to fix this week.'\n"
+        "\nRequirements for strengths array:\n"
+        "- Exactly 3 short, specific observations about what went well.\n"
+        "- Each 5-10 words, e.g. 'Expressive rubato in bars 3-5'.\n"
+        "- Base these on timing, dynamics, or correct passages in the diff."
     )
     user_prompt = (
         "Performance diff JSON:\n"
@@ -829,22 +871,19 @@ def _generate_tutor_script_with_gemini(diff_payload: dict[str, Any]) -> tuple[st
     errors: list[str] = []
     for model in model_candidates:
         try:
-            script = _generate_for_model(model, base_request_payload)
+            raw = _generate_for_model(model, base_request_payload)
+            script, written_note, strengths = _parse_tutor_json(raw)
             word_count = _count_words(script)
             if word_count >= MIN_TUTOR_WORDS:
-                return script, model
+                return script, written_note, model, strengths
 
             retry_prompt = (
-                "Your previous output was too short for audio playback.\n"
-                f"Previous output ({word_count} words): {script}\n\n"
-                "Rewrite the tutor script using the same performance diff.\n"
-                "Hard requirements:\n"
-                f"- At least {MIN_TUTOR_WORDS} words.\n"
-                f"- At least {int(MIN_TUTOR_SECONDS)} seconds when spoken naturally.\n"
-                "- Keep it concise and practical.\n"
-                "- Reference at least two timestamps.\n"
-                "- End with one focused practice tip.\n"
-                "- Plain text only."
+                "Your previous JSON output had a script that was too short for audio playback.\n"
+                f"Previous script ({word_count} words): {script}\n\n"
+                "Rewrite using the same performance diff. Output valid JSON only:\n"
+                "{\"script\": \"...\", \"writtenNote\": \"...\", \"strengths\": [\"...\", \"...\", \"...\"]}\n"
+                f"The script must have at least {MIN_TUTOR_WORDS} words.\n"
+                "Keep all other requirements the same."
             )
             retry_payload = {
                 "systemInstruction": base_request_payload["systemInstruction"],
@@ -854,10 +893,11 @@ def _generate_tutor_script_with_gemini(diff_payload: dict[str, Any]) -> tuple[st
                     "maxOutputTokens": 520,
                 },
             }
-            retry_script = _generate_for_model(model, retry_payload)
+            retry_raw = _generate_for_model(model, retry_payload)
+            retry_script, retry_written_note, retry_strengths = _parse_tutor_json(retry_raw)
             retry_words = _count_words(retry_script)
             if retry_words >= MIN_TUTOR_WORDS:
-                return retry_script, model
+                return retry_script, retry_written_note, model, retry_strengths
             errors.append(
                 f"{model}: output too short ({word_count} words, retry {retry_words} words)"
             )
@@ -1226,6 +1266,11 @@ async def upload_midi(file: UploadFile = File(...)) -> dict:
     musicxml_text: str | None = None
     try:
         score = converter.parse(str(midi_path)).quantize()
+        title = Path(file.filename).stem if file.filename else "Score"
+        from music21 import metadata as m21meta
+        score.metadata = m21meta.Metadata()
+        score.metadata.title = title
+        score.metadata.composer = ""
         score.write("musicxml", fp=str(xml_path))
         musicxml_text = xml_path.read_text(encoding="utf-8")
     except Exception as e:
@@ -1741,7 +1786,7 @@ async def tutor(request: Request) -> dict:
         posture_payload,
         piece_name="Mariage d'Amour (mariage_15s excerpt)",
     )
-    tutor_script, gemini_model = _generate_tutor_script_with_gemini(diff_payload)
+    tutor_script, written_note, gemini_model, strengths = _generate_tutor_script_with_gemini(diff_payload)
     tutor_word_count = _count_words(tutor_script)
     estimated_seconds = round(_estimate_tutor_seconds(tutor_script), 1)
     voice_id, audio_path = _synthesize_tutor_audio(tutor_script, sdir=sdir)
@@ -1751,6 +1796,8 @@ async def tutor(request: Request) -> dict:
         "piece": diff_payload["piece"],
         "diff": diff_payload,
         "tutorScript": tutor_script,
+        "writtenNote": written_note,
+        "strengths": strengths,
         "tutorWordCount": tutor_word_count,
         "estimatedSpeechSeconds": estimated_seconds,
         "minimumTargetSeconds": MIN_TUTOR_SECONDS,
