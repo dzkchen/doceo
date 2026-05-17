@@ -2,7 +2,7 @@
   <img src="https://img.shields.io/badge/Built%20for-Eureka%20Hacks-7c3aed?style=for-the-badge" alt="Built for Eureka Hacks" />
 </p>
 
-<h1 align="center"><b>Privtor AI</b></h1>
+<h1 align="center"><b>Doce</b></h1>
 
 <p align="center">
   AI piano practice coach for turning one performance video into score alignment, posture checks, and actionable feedback.
@@ -35,11 +35,11 @@ Most practice tools only tell you whether a note was right or wrong. I wanted a 
 - Did my posture look healthy while I was playing?
 - What should I fix next, in plain language?
 
-That idea became Privtor AI: a performance tutor that combines audio analysis, video analysis, and an AI-generated coaching layer.
+That idea became Doceo: a performance tutor that combines audio analysis, video analysis, and an AI-generated coaching layer.
 
 ## What It Does
 
-Privtor AI takes in:
+Doceo takes in:
 
 - a reference MIDI file
 - a performance video
@@ -188,7 +188,7 @@ uvicorn main:app --reload --port 8000
 or 
 
 ```bash
-cd /Users/dzkchen/privtor-ai/api
+cd /Users/dzkchen/doceo/api
 source .venv/bin/activate
 python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
